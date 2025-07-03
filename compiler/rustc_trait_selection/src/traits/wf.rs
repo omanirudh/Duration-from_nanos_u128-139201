@@ -6,12 +6,13 @@
 use std::iter;
 
 use rustc_hir as hir;
+use rustc_hir::def::DefKind;
 use rustc_hir::lang_items::LangItem;
 use rustc_infer::traits::{ObligationCauseCode, PredicateObligations};
 use rustc_middle::bug;
 use rustc_middle::ty::{
-    self, GenericArg, GenericArgKind, GenericArgsRef, Ty, TyCtxt, TypeSuperVisitable,
-    TypeVisitable, TypeVisitableExt, TypeVisitor,
+    self, GenericArgsRef, Term, TermKind, Ty, TyCtxt, TypeSuperVisitable, TypeVisitable,
+    TypeVisitableExt, TypeVisitor,
 };
 use rustc_session::parse::feature_err;
 use rustc_span::def_id::{DefId, LocalDefId};
@@ -32,12 +33,12 @@ pub fn obligations<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     body_id: LocalDefId,
     recursion_depth: usize,
-    arg: GenericArg<'tcx>,
+    term: Term<'tcx>,
     span: Span,
 ) -> Option<PredicateObligations<'tcx>> {
     // Handle the "cycle" case (see comment above) by bailing out if necessary.
-    let arg = match arg.unpack() {
-        GenericArgKind::Type(ty) => {
+    let term = match term.kind() {
+        TermKind::Ty(ty) => {
             match ty.kind() {
                 ty::Infer(ty::TyVar(_)) => {
                     let resolved_ty = infcx.shallow_resolve(ty);
@@ -52,7 +53,7 @@ pub fn obligations<'tcx>(
             }
             .into()
         }
-        GenericArgKind::Const(ct) => {
+        TermKind::Const(ct) => {
             match ct.kind() {
                 ty::ConstKind::Infer(_) => {
                     let resolved = infcx.shallow_resolve_const(ct);
@@ -67,8 +68,6 @@ pub fn obligations<'tcx>(
             }
             .into()
         }
-        // There is nothing we have to do for lifetimes.
-        GenericArgKind::Lifetime(..) => return Some(PredicateObligations::new()),
     };
 
     let mut wf = WfPredicates {
@@ -80,11 +79,11 @@ pub fn obligations<'tcx>(
         recursion_depth,
         item: None,
     };
-    wf.add_wf_preds_for_generic_arg(arg);
-    debug!("wf::obligations({:?}, body_id={:?}) = {:?}", arg, body_id, wf.out);
+    wf.add_wf_preds_for_term(term);
+    debug!("wf::obligations({:?}, body_id={:?}) = {:?}", term, body_id, wf.out);
 
     let result = wf.normalize(infcx);
-    debug!("wf::obligations({:?}, body_id={:?}) ~~> {:?}", arg, body_id, result);
+    debug!("wf::obligations({:?}, body_id={:?}) ~~> {:?}", term, body_id, result);
     Some(result)
 }
 
@@ -95,21 +94,17 @@ pub fn obligations<'tcx>(
 pub fn unnormalized_obligations<'tcx>(
     infcx: &InferCtxt<'tcx>,
     param_env: ty::ParamEnv<'tcx>,
-    arg: GenericArg<'tcx>,
+    term: Term<'tcx>,
     span: Span,
     body_id: LocalDefId,
 ) -> Option<PredicateObligations<'tcx>> {
-    debug_assert_eq!(arg, infcx.resolve_vars_if_possible(arg));
+    debug_assert_eq!(term, infcx.resolve_vars_if_possible(term));
 
     // However, if `arg` IS an unresolved inference variable, returns `None`,
     // because we are not able to make any progress at all. This is to prevent
     // cycles where we say "?0 is WF if ?0 is WF".
-    if arg.is_non_region_infer() {
+    if term.is_infer() {
         return None;
-    }
-
-    if let ty::GenericArgKind::Lifetime(..) = arg.unpack() {
-        return Some(PredicateObligations::new());
     }
 
     let mut wf = WfPredicates {
@@ -121,7 +116,7 @@ pub fn unnormalized_obligations<'tcx>(
         recursion_depth: 0,
         item: None,
     };
-    wf.add_wf_preds_for_generic_arg(arg);
+    wf.add_wf_preds_for_term(term);
     Some(wf.out)
 }
 
@@ -185,22 +180,22 @@ pub fn clause_obligations<'tcx>(
         }
         ty::ClauseKind::RegionOutlives(..) => {}
         ty::ClauseKind::TypeOutlives(ty::OutlivesPredicate(ty, _reg)) => {
-            wf.add_wf_preds_for_generic_arg(ty.into());
+            wf.add_wf_preds_for_term(ty.into());
         }
         ty::ClauseKind::Projection(t) => {
             wf.add_wf_preds_for_alias_term(t.projection_term);
-            wf.add_wf_preds_for_generic_arg(t.term.into_arg());
+            wf.add_wf_preds_for_term(t.term);
         }
         ty::ClauseKind::ConstArgHasType(ct, ty) => {
-            wf.add_wf_preds_for_generic_arg(ct.into());
-            wf.add_wf_preds_for_generic_arg(ty.into());
+            wf.add_wf_preds_for_term(ct.into());
+            wf.add_wf_preds_for_term(ty.into());
         }
-        ty::ClauseKind::WellFormed(arg) => {
-            wf.add_wf_preds_for_generic_arg(arg);
+        ty::ClauseKind::WellFormed(term) => {
+            wf.add_wf_preds_for_term(term);
         }
 
         ty::ClauseKind::ConstEvaluatable(ct) => {
-            wf.add_wf_preds_for_generic_arg(ct.into());
+            wf.add_wf_preds_for_term(ct.into());
         }
     }
 
@@ -426,11 +421,9 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
                 .args
                 .iter()
                 .enumerate()
-                .filter(|(_, arg)| {
-                    matches!(arg.unpack(), GenericArgKind::Type(..) | GenericArgKind::Const(..))
-                })
-                .filter(|(_, arg)| !arg.has_escaping_bound_vars())
-                .map(|(i, arg)| {
+                .filter_map(|(i, arg)| arg.as_term().map(|t| (i, t)))
+                .filter(|(_, term)| !term.has_escaping_bound_vars())
+                .map(|(i, term)| {
                     let mut cause = traits::ObligationCause::misc(self.span, self.body_id);
                     // The first arg is the self ty - use the correct span for it.
                     if i == 0 {
@@ -445,9 +438,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
                         cause,
                         depth,
                         param_env,
-                        ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(
-                            arg,
-                        ))),
+                        ty::ClauseKind::WellFormed(term),
                     )
                 }),
         );
@@ -457,7 +448,9 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
     // given that it is a *negative* trait predicate.
     fn add_wf_preds_for_negative_trait_pred(&mut self, trait_ref: ty::TraitRef<'tcx>) {
         for arg in trait_ref.args {
-            self.add_wf_preds_for_generic_arg(arg);
+            if let Some(term) = arg.as_term() {
+                self.add_wf_preds_for_term(term);
+            }
         }
     }
 
@@ -494,7 +487,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
     /// Pushes the obligations required for an inherent alias to be WF
     /// into `self.out`.
     // FIXME(inherent_associated_types): Merge this function with `fn compute_alias`.
-    fn add_wf_preds_for_inherent_projection(&mut self, data: ty::AliasTy<'tcx>) {
+    fn add_wf_preds_for_inherent_projection(&mut self, data: ty::AliasTerm<'tcx>) {
         // An inherent projection is well-formed if
         //
         // (a) its predicates hold (*)
@@ -506,7 +499,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         if !data.self_ty().has_escaping_bound_vars() {
             // FIXME(inherent_associated_types): Should this happen inside of a snapshot?
             // FIXME(inherent_associated_types): This is incompatible with the new solver and lazy norm!
-            let args = traits::project::compute_inherent_assoc_ty_args(
+            let args = traits::project::compute_inherent_assoc_term_args(
                 &mut traits::SelectionContext::new(self.infcx),
                 self.param_env,
                 data,
@@ -529,19 +522,15 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
 
         self.out.extend(
             args.iter()
-                .filter(|arg| {
-                    matches!(arg.unpack(), GenericArgKind::Type(..) | GenericArgKind::Const(..))
-                })
-                .filter(|arg| !arg.has_escaping_bound_vars())
-                .map(|arg| {
+                .filter_map(|arg| arg.as_term())
+                .filter(|term| !term.has_escaping_bound_vars())
+                .map(|term| {
                     traits::Obligation::with_depth(
                         tcx,
                         cause.clone(),
                         depth,
                         param_env,
-                        ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(
-                            arg,
-                        ))),
+                        ty::ClauseKind::WellFormed(term),
                     )
                 }),
         );
@@ -552,7 +541,7 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
             let cause = self.cause(cause);
             let trait_ref = ty::TraitRef::new(
                 self.tcx(),
-                self.tcx().require_lang_item(LangItem::Sized, Some(cause.span)),
+                self.tcx().require_lang_item(LangItem::Sized, cause.span),
                 [subty],
             );
             self.out.push(traits::Obligation::with_depth(
@@ -565,10 +554,10 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         }
     }
 
-    /// Pushes all the predicates needed to validate that `ty` is WF into `out`.
+    /// Pushes all the predicates needed to validate that `term` is WF into `out`.
     #[instrument(level = "debug", skip(self))]
-    fn add_wf_preds_for_generic_arg(&mut self, arg: GenericArg<'tcx>) {
-        arg.visit_with(self);
+    fn add_wf_preds_for_term(&mut self, term: Term<'tcx>) {
+        term.visit_with(self);
         debug!(?self.out);
     }
 
@@ -578,6 +567,14 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
         def_id: DefId,
         args: GenericArgsRef<'tcx>,
     ) -> PredicateObligations<'tcx> {
+        // PERF: `Sized`'s predicates include `MetaSized`, but both are compiler implemented marker
+        // traits, so `MetaSized` will always be WF if `Sized` is WF and vice-versa. Determining
+        // the nominal obligations of `Sized` would in-effect just elaborate `MetaSized` and make
+        // the compiler do a bunch of work needlessly.
+        if self.tcx().is_lang_item(def_id, LangItem::Sized) {
+            return Default::default();
+        }
+
         let predicates = self.tcx().predicates_of(def_id);
         let mut origins = vec![def_id; predicates.predicates.len()];
         let mut head = predicates;
@@ -670,6 +667,50 @@ impl<'a, 'tcx> WfPredicates<'a, 'tcx> {
             // ```
         }
     }
+
+    fn add_wf_preds_for_pat_ty(&mut self, base_ty: Ty<'tcx>, pat: ty::Pattern<'tcx>) {
+        let tcx = self.tcx();
+        match *pat {
+            ty::PatternKind::Range { start, end } => {
+                let mut check = |c| {
+                    let cause = self.cause(ObligationCauseCode::Misc);
+                    self.out.push(traits::Obligation::with_depth(
+                        tcx,
+                        cause.clone(),
+                        self.recursion_depth,
+                        self.param_env,
+                        ty::Binder::dummy(ty::PredicateKind::Clause(
+                            ty::ClauseKind::ConstArgHasType(c, base_ty),
+                        )),
+                    ));
+                    if !tcx.features().generic_pattern_types() {
+                        if c.has_param() {
+                            if self.span.is_dummy() {
+                                self.tcx()
+                                    .dcx()
+                                    .delayed_bug("feature error should be reported elsewhere, too");
+                            } else {
+                                feature_err(
+                                    &self.tcx().sess,
+                                    sym::generic_pattern_types,
+                                    self.span,
+                                    "wraparound pattern type ranges cause monomorphization time errors",
+                                )
+                                .emit();
+                            }
+                        }
+                    }
+                };
+                check(start);
+                check(end);
+            }
+            ty::PatternKind::Or(patterns) => {
+                for pat in patterns {
+                    self.add_wf_preds_for_pat_ty(base_ty, pat)
+                }
+            }
+        }
+    }
 }
 
 impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
@@ -722,43 +763,9 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 ));
             }
 
-            ty::Pat(subty, pat) => {
-                self.require_sized(subty, ObligationCauseCode::Misc);
-                match *pat {
-                    ty::PatternKind::Range { start, end } => {
-                        let mut check = |c| {
-                            let cause = self.cause(ObligationCauseCode::Misc);
-                            self.out.push(traits::Obligation::with_depth(
-                                tcx,
-                                cause.clone(),
-                                self.recursion_depth,
-                                self.param_env,
-                                ty::Binder::dummy(ty::PredicateKind::Clause(
-                                    ty::ClauseKind::ConstArgHasType(c, subty),
-                                )),
-                            ));
-                            if !tcx.features().generic_pattern_types() {
-                                if c.has_param() {
-                                    if self.span.is_dummy() {
-                                        self.tcx().dcx().delayed_bug(
-                                            "feature error should be reported elsewhere, too",
-                                        );
-                                    } else {
-                                        feature_err(
-                                            &self.tcx().sess,
-                                            sym::generic_pattern_types,
-                                            self.span,
-                                            "wraparound pattern type ranges cause monomorphization time errors",
-                                        )
-                                        .emit();
-                                    }
-                                }
-                            }
-                        };
-                        check(start);
-                        check(end);
-                    }
-                }
+            ty::Pat(base_ty, pat) => {
+                self.require_sized(base_ty, ObligationCauseCode::Misc);
+                self.add_wf_preds_for_pat_ty(base_ty, pat);
             }
 
             ty::Tuple(tys) => {
@@ -773,12 +780,12 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                 // Simple cases that are WF if their type args are WF.
             }
 
-            ty::Alias(ty::Projection | ty::Opaque | ty::Weak, data) => {
+            ty::Alias(ty::Projection | ty::Opaque | ty::Free, data) => {
                 let obligations = self.nominal_obligations(data.def_id, data.args);
                 self.out.extend(obligations);
             }
             ty::Alias(ty::Inherent, data) => {
-                self.add_wf_preds_for_inherent_projection(data);
+                self.add_wf_preds_for_inherent_projection(data.into());
                 return; // Subtree handled by compute_inherent_projection.
             }
 
@@ -896,7 +903,7 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                                 self.tcx(),
                                 self.tcx().require_lang_item(
                                     LangItem::BikeshedGuaranteedNoDrop,
-                                    Some(self.span),
+                                    self.span,
                                 ),
                                 [ty],
                             )
@@ -963,9 +970,6 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
         match c.kind() {
             ty::ConstKind::Unevaluated(uv) => {
                 if !c.has_escaping_bound_vars() {
-                    let obligations = self.nominal_obligations(uv.def, uv.args);
-                    self.out.extend(obligations);
-
                     let predicate = ty::Binder::dummy(ty::PredicateKind::Clause(
                         ty::ClauseKind::ConstEvaluatable(c),
                     ));
@@ -977,6 +981,16 @@ impl<'a, 'tcx> TypeVisitor<TyCtxt<'tcx>> for WfPredicates<'a, 'tcx> {
                         self.param_env,
                         predicate,
                     ));
+
+                    if tcx.def_kind(uv.def) == DefKind::AssocConst
+                        && tcx.def_kind(tcx.parent(uv.def)) == (DefKind::Impl { of_trait: false })
+                    {
+                        self.add_wf_preds_for_inherent_projection(uv.into());
+                        return; // Subtree is handled by above function
+                    } else {
+                        let obligations = self.nominal_obligations(uv.def, uv.args);
+                        self.out.extend(obligations);
+                    }
                 }
             }
             ty::ConstKind::Infer(_) => {

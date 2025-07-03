@@ -162,11 +162,6 @@ impl Command {
         }
     }
 
-    pub fn output(&mut self) -> io::Result<(ExitStatus, Vec<u8>, Vec<u8>)> {
-        let (proc, pipes) = self.spawn(Stdio::MakePipe, false)?;
-        crate::sys_common::process::wait_with_output(proc, pipes)
-    }
-
     // WatchOS and TVOS headers mark the `fork`/`exec*` functions with
     // `__WATCHOS_PROHIBITED __TVOS_PROHIBITED`, and indicate that the
     // `posix_spawn*` functions should be used instead. It isn't entirely clear
@@ -328,6 +323,15 @@ impl Command {
                 cvt(libc::setuid(u as uid_t))?;
             }
         }
+        if let Some(chroot) = self.get_chroot() {
+            #[cfg(not(target_os = "fuchsia"))]
+            cvt(libc::chroot(chroot.as_ptr()))?;
+            #[cfg(target_os = "fuchsia")]
+            return Err(io::const_error!(
+                io::ErrorKind::Unsupported,
+                "chroot not supported by fuchsia"
+            ));
+        }
         if let Some(cwd) = self.get_cwd() {
             cvt(libc::chdir(cwd.as_ptr()))?;
         }
@@ -442,7 +446,7 @@ impl Command {
         envp: Option<&CStringArray>,
     ) -> io::Result<Option<Process>> {
         #[cfg(target_os = "linux")]
-        use core::sync::atomic::{AtomicU8, Ordering};
+        use core::sync::atomic::{Atomic, AtomicU8, Ordering};
 
         use crate::mem::MaybeUninit;
         use crate::sys::{self, cvt_nz, on_broken_pipe_flag_used};
@@ -452,6 +456,7 @@ impl Command {
             || (self.env_saw_path() && !self.program_is_path())
             || !self.get_closures().is_empty()
             || self.get_groups().is_some()
+            || self.get_chroot().is_some()
         {
             return Ok(None);
         }
@@ -475,7 +480,7 @@ impl Command {
                     fn pidfd_getpid(pidfd: libc::c_int) -> libc::c_int;
                 );
 
-                static PIDFD_SUPPORTED: AtomicU8 = AtomicU8::new(0);
+                static PIDFD_SUPPORTED: Atomic<u8> = AtomicU8::new(0);
                 const UNKNOWN: u8 = 0;
                 const SPAWN: u8 = 1;
                 // Obtaining a pidfd via the fork+exec path might work
@@ -958,9 +963,13 @@ impl Process {
         self.pid as u32
     }
 
-    pub fn kill(&mut self) -> io::Result<()> {
-        // If we've already waited on this process then the pid can be recycled
-        // and used for another process, and we probably shouldn't be killing
+    pub fn kill(&self) -> io::Result<()> {
+        self.send_signal(libc::SIGKILL)
+    }
+
+    pub(crate) fn send_signal(&self, signal: i32) -> io::Result<()> {
+        // If we've already waited on this process then the pid can be recycled and
+        // used for another process, and we probably shouldn't be sending signals to
         // random processes, so return Ok because the process has exited already.
         if self.status.is_some() {
             return Ok(());
@@ -968,9 +977,9 @@ impl Process {
         #[cfg(target_os = "linux")]
         if let Some(pid_fd) = self.pidfd.as_ref() {
             // pidfd_send_signal predates pidfd_open. so if we were able to get an fd then sending signals will work too
-            return pid_fd.kill();
+            return pid_fd.send_signal(signal);
         }
-        cvt(unsafe { libc::kill(self.pid, libc::SIGKILL) }).map(drop)
+        cvt(unsafe { libc::kill(self.pid, signal) }).map(drop)
     }
 
     pub fn wait(&mut self) -> io::Result<ExitStatus> {

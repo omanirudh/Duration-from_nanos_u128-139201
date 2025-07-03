@@ -2,32 +2,36 @@
 
 pub(crate) use gen_trait_fn_body::gen_trait_fn_body;
 use hir::{
-    db::{ExpandDatabase, HirDatabase},
     DisplayTarget, HasAttrs as HirHasAttrs, HirDisplay, InFile, ModuleDef, PathResolution,
     Semantics,
+    db::{ExpandDatabase, HirDatabase},
 };
 use ide_db::{
+    RootDatabase,
+    assists::ExprFillDefaultMode,
     famous_defs::FamousDefs,
     path_transform::PathTransform,
     syntax_helpers::{node_ext::preorder_expr, prettify_macro_expansion},
-    RootDatabase,
 };
 use stdx::format_to;
 use syntax::{
+    AstNode, AstToken, Direction, NodeOrToken, SourceFile,
+    SyntaxKind::*,
+    SyntaxNode, SyntaxToken, T, TextRange, TextSize, WalkEvent,
     ast::{
-        self,
+        self, HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
         edit::{AstNodeEdit, IndentLevel},
         edit_in_place::{AttrsOwnerEdit, Indent, Removable},
         make,
         syntax_factory::SyntaxFactory,
-        HasArgList, HasAttrs, HasGenericParams, HasName, HasTypeBounds, Whitespace,
     },
-    ted, AstNode, AstToken, Direction, NodeOrToken, SourceFile,
-    SyntaxKind::*,
-    SyntaxNode, SyntaxToken, TextRange, TextSize, WalkEvent, T,
+    ted,
 };
 
-use crate::assist_context::{AssistContext, SourceChangeBuilder};
+use crate::{
+    AssistConfig,
+    assist_context::{AssistContext, SourceChangeBuilder},
+};
 
 mod gen_trait_fn_body;
 pub(crate) mod ref_field_expr;
@@ -82,11 +86,7 @@ pub fn test_related_attribute_syn(fn_def: &ast::Fn) -> Option<ast::Attr> {
     fn_def.attrs().find_map(|attr| {
         let path = attr.path()?;
         let text = path.syntax().text().to_string();
-        if text.starts_with("test") || text.ends_with("test") {
-            Some(attr)
-        } else {
-            None
-        }
+        if text.starts_with("test") || text.ends_with("test") { Some(attr) } else { None }
     })
 }
 
@@ -178,6 +178,7 @@ pub fn filter_assoc_items(
 /// inserted.
 pub fn add_trait_assoc_items_to_impl(
     sema: &Semantics<'_, RootDatabase>,
+    config: &AssistConfig,
     original_items: &[InFile<ast::AssocItem>],
     trait_: hir::Trait,
     impl_: &ast::Impl,
@@ -216,13 +217,21 @@ pub fn add_trait_assoc_items_to_impl(
     });
 
     let assoc_item_list = impl_.get_or_create_assoc_item_list();
+
     let mut first_item = None;
     for item in items {
         first_item.get_or_insert_with(|| item.clone());
         match &item {
             ast::AssocItem::Fn(fn_) if fn_.body().is_none() => {
                 let body = AstNodeEdit::indent(
-                    &make::block_expr(None, Some(make::ext::expr_todo())),
+                    &make::block_expr(
+                        None,
+                        Some(match config.expr_fill_default {
+                            ExprFillDefaultMode::Todo => make::ext::expr_todo(),
+                            ExprFillDefaultMode::Underscore => make::ext::expr_underscore(),
+                            ExprFillDefaultMode::Default => make::ext::expr_todo(),
+                        }),
+                    ),
                     new_indent_level,
                 );
                 ted::replace(fn_.get_or_create_body().syntax(), body.clone_for_update().syntax())
@@ -333,7 +342,11 @@ fn invert_special_case_legacy(expr: &ast::Expr) -> Option<ast::Expr> {
                 T![>] => T![<=],
                 T![>=] => T![<],
                 // Parenthesize other expressions before prefixing `!`
-                _ => return Some(make::expr_prefix(T![!], make::expr_paren(expr.clone())).into()),
+                _ => {
+                    return Some(
+                        make::expr_prefix(T![!], make::expr_paren(expr.clone()).into()).into(),
+                    );
+                }
             };
             ted::replace(op_token, make::token(rev_token));
             Some(bin.into())
@@ -350,7 +363,7 @@ fn invert_special_case_legacy(expr: &ast::Expr) -> Option<ast::Expr> {
                 "is_err" => "is_ok",
                 _ => return None,
             };
-            Some(make::expr_method_call(receiver, make::name_ref(method), arg_list))
+            Some(make::expr_method_call(receiver, make::name_ref(method), arg_list).into())
         }
         ast::Expr::PrefixExpr(pe) if pe.op_kind()? == ast::UnaryOp::Not => match pe.expr()? {
             ast::Expr::ParenExpr(parexpr) => parexpr.expr(),
@@ -392,7 +405,7 @@ pub(crate) fn does_pat_variant_nested_or_literal(ctx: &AssistContext<'_>, pat: &
 }
 
 fn check_pat_variant_from_enum(ctx: &AssistContext<'_>, pat: &ast::Pat) -> bool {
-    ctx.sema.type_of_pat(pat).is_none_or(|ty: hir::TypeInfo| {
+    ctx.sema.type_of_pat(pat).is_none_or(|ty: hir::TypeInfo<'_>| {
         ty.adjusted().as_adt().is_some_and(|adt| matches!(adt, hir::Adt::Enum(_)))
     })
 }
@@ -498,11 +511,7 @@ pub(crate) fn find_struct_impl(
         };
         let not_trait_impl = blk.trait_(db).is_none();
 
-        if !(same_ty && not_trait_impl) {
-            None
-        } else {
-            Some(impl_blk)
-        }
+        if !(same_ty && not_trait_impl) { None } else { Some(impl_blk) }
     });
 
     if let Some(ref impl_blk) = block {
@@ -771,9 +780,9 @@ pub(crate) fn add_method_to_adt(
 }
 
 #[derive(Debug)]
-pub(crate) struct ReferenceConversion {
+pub(crate) struct ReferenceConversion<'db> {
     conversion: ReferenceConversionType,
-    ty: hir::Type,
+    ty: hir::Type<'db>,
     impls_deref: bool,
 }
 
@@ -793,10 +802,10 @@ enum ReferenceConversionType {
     Result,
 }
 
-impl ReferenceConversion {
+impl<'db> ReferenceConversion<'db> {
     pub(crate) fn convert_type(
         &self,
-        db: &dyn HirDatabase,
+        db: &'db dyn HirDatabase,
         display_target: DisplayTarget,
     ) -> ast::Type {
         let ty = match self.conversion {
@@ -859,6 +868,7 @@ impl ReferenceConversion {
                     make::expr_ref(expr, false)
                 } else {
                     make::expr_method_call(expr, make::name_ref("as_ref"), make::arg_list([]))
+                        .into()
                 }
             }
         }
@@ -868,11 +878,11 @@ impl ReferenceConversion {
 // FIXME: It should return a new hir::Type, but currently constructing new types is too cumbersome
 //        and all users of this function operate on string type names, so they can do the conversion
 //        itself themselves.
-pub(crate) fn convert_reference_type(
-    ty: hir::Type,
-    db: &RootDatabase,
-    famous_defs: &FamousDefs<'_, '_>,
-) -> Option<ReferenceConversion> {
+pub(crate) fn convert_reference_type<'db>(
+    ty: hir::Type<'db>,
+    db: &'db RootDatabase,
+    famous_defs: &FamousDefs<'_, 'db>,
+) -> Option<ReferenceConversion<'db>> {
     handle_copy(&ty, db)
         .or_else(|| handle_as_ref_str(&ty, db, famous_defs))
         .or_else(|| handle_as_ref_slice(&ty, db, famous_defs))
@@ -882,18 +892,21 @@ pub(crate) fn convert_reference_type(
         .map(|(conversion, impls_deref)| ReferenceConversion { ty, conversion, impls_deref })
 }
 
-fn could_deref_to_target(ty: &hir::Type, target: &hir::Type, db: &dyn HirDatabase) -> bool {
+fn could_deref_to_target(ty: &hir::Type<'_>, target: &hir::Type<'_>, db: &dyn HirDatabase) -> bool {
     let ty_ref = ty.add_reference(hir::Mutability::Shared);
     let target_ref = target.add_reference(hir::Mutability::Shared);
     ty_ref.could_coerce_to(db, &target_ref)
 }
 
-fn handle_copy(ty: &hir::Type, db: &dyn HirDatabase) -> Option<(ReferenceConversionType, bool)> {
+fn handle_copy(
+    ty: &hir::Type<'_>,
+    db: &dyn HirDatabase,
+) -> Option<(ReferenceConversionType, bool)> {
     ty.is_copy(db).then_some((ReferenceConversionType::Copy, true))
 }
 
 fn handle_as_ref_str(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
 ) -> Option<(ReferenceConversionType, bool)> {
@@ -904,7 +917,7 @@ fn handle_as_ref_str(
 }
 
 fn handle_as_ref_slice(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
 ) -> Option<(ReferenceConversionType, bool)> {
@@ -918,7 +931,7 @@ fn handle_as_ref_slice(
 }
 
 fn handle_dereferenced(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
 ) -> Option<(ReferenceConversionType, bool)> {
@@ -931,7 +944,7 @@ fn handle_dereferenced(
 }
 
 fn handle_option_as_ref(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
 ) -> Option<(ReferenceConversionType, bool)> {
@@ -943,7 +956,7 @@ fn handle_option_as_ref(
 }
 
 fn handle_result_as_ref(
-    ty: &hir::Type,
+    ty: &hir::Type<'_>,
     db: &dyn HirDatabase,
     famous_defs: &FamousDefs<'_, '_>,
 ) -> Option<(ReferenceConversionType, bool)> {
@@ -1026,6 +1039,20 @@ fn test_required_hashes() {
     assert_eq!(0, required_hashes("#abc"));
     assert_eq!(3, required_hashes("#ab\"##c"));
     assert_eq!(5, required_hashes("#ab\"##\"####c"));
+}
+
+/// Calculate the string literal suffix length
+pub(crate) fn string_suffix(s: &str) -> Option<&str> {
+    s.rfind(['"', '\'', '#']).map(|i| &s[i + 1..])
+}
+#[test]
+fn test_string_suffix() {
+    assert_eq!(Some(""), string_suffix(r#""abc""#));
+    assert_eq!(Some(""), string_suffix(r#""""#));
+    assert_eq!(Some("a"), string_suffix(r#"""a"#));
+    assert_eq!(Some("i32"), string_suffix(r#"""i32"#));
+    assert_eq!(Some("i32"), string_suffix(r#"r""i32"#));
+    assert_eq!(Some("i32"), string_suffix(r##"r#""#i32"##));
 }
 
 /// Replaces the record expression, handling field shorthands including inside macros.

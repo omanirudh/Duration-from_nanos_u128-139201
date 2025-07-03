@@ -4,6 +4,7 @@ use rustc_macros::{Decodable_NoContext, Encodable_NoContext, HashStable_NoContex
 use rustc_type_ir_macros::{TypeFoldable_Generic, TypeVisitable_Generic};
 
 use crate::fold::TypeFoldable;
+use crate::inherent::*;
 use crate::relate::RelateResult;
 use crate::relate::combine::PredicateEmittingRelation;
 use crate::{self as ty, Interner};
@@ -12,7 +13,7 @@ use crate::{self as ty, Interner};
 /// slightly different typing rules depending on the current context. See the
 /// doc comment for each variant for how and why they are used.
 ///
-/// In most cases you can get the correct typing mode automically via:
+/// In most cases you can get the correct typing mode automatically via:
 /// - `mir::Body::typing_mode`
 /// - `rustc_lint::LateContext::typing_mode`
 ///
@@ -100,7 +101,7 @@ impl<I: Interner> TypingMode<I> {
     pub fn typeck_for_body(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
         TypingMode::Analysis {
             defining_opaque_types_and_generators: cx
-                .opaque_types_and_generators_defined_by(body_def_id),
+                .opaque_types_and_coroutines_defined_by(body_def_id),
         }
     }
 
@@ -116,12 +117,20 @@ impl<I: Interner> TypingMode<I> {
     }
 
     pub fn borrowck(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
-        TypingMode::Borrowck { defining_opaque_types: cx.opaque_types_defined_by(body_def_id) }
+        let defining_opaque_types = cx.opaque_types_defined_by(body_def_id);
+        if defining_opaque_types.is_empty() {
+            TypingMode::non_body_analysis()
+        } else {
+            TypingMode::Borrowck { defining_opaque_types }
+        }
     }
 
     pub fn post_borrowck_analysis(cx: I, body_def_id: I::LocalDefId) -> TypingMode<I> {
-        TypingMode::PostBorrowckAnalysis {
-            defined_opaque_types: cx.opaque_types_defined_by(body_def_id),
+        let defined_opaque_types = cx.opaque_types_defined_by(body_def_id);
+        if defined_opaque_types.is_empty() {
+            TypingMode::non_body_analysis()
+        } else {
+            TypingMode::PostBorrowckAnalysis { defined_opaque_types }
         }
     }
 }
@@ -165,6 +174,8 @@ pub trait InferCtxtLike: Sized {
         &self,
         vid: ty::RegionVid,
     ) -> <Self::Interner as Interner>::Region;
+
+    fn is_changed_arg(&self, arg: <Self::Interner as Interner>::GenericArg) -> bool;
 
     fn next_region_infer(&self) -> <Self::Interner as Interner>::Region;
     fn next_ty_infer(&self) -> <Self::Interner as Interner>::Ty;
@@ -245,4 +256,32 @@ pub trait InferCtxtLike: Sized {
         r: <Self::Interner as Interner>::Region,
         span: <Self::Interner as Interner>::Span,
     );
+
+    type OpaqueTypeStorageEntries: OpaqueTypeStorageEntries;
+    fn opaque_types_storage_num_entries(&self) -> Self::OpaqueTypeStorageEntries;
+    fn clone_opaque_types_lookup_table(
+        &self,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+    fn clone_duplicate_opaque_types(
+        &self,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+    fn clone_opaque_types_added_since(
+        &self,
+        prev_entries: Self::OpaqueTypeStorageEntries,
+    ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+
+    fn register_hidden_type_in_storage(
+        &self,
+        opaque_type_key: ty::OpaqueTypeKey<Self::Interner>,
+        hidden_ty: <Self::Interner as Interner>::Ty,
+        span: <Self::Interner as Interner>::Span,
+    ) -> Option<<Self::Interner as Interner>::Ty>;
+    fn add_duplicate_opaque_type(
+        &self,
+        opaque_type_key: ty::OpaqueTypeKey<Self::Interner>,
+        hidden_ty: <Self::Interner as Interner>::Ty,
+        span: <Self::Interner as Interner>::Span,
+    );
+
+    fn reset_opaque_types(&self);
 }

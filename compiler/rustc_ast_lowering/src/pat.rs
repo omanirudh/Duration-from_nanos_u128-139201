@@ -390,19 +390,15 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         allow_paths: bool,
     ) -> &'hir hir::PatExpr<'hir> {
         let span = self.lower_span(expr.span);
-        let err = |guar| hir::PatExprKind::Lit {
-            lit: self.arena.alloc(respan(span, LitKind::Err(guar))),
-            negated: false,
-        };
+        let err =
+            |guar| hir::PatExprKind::Lit { lit: respan(span, LitKind::Err(guar)), negated: false };
         let kind = match &expr.kind {
             ExprKind::Lit(lit) => {
                 hir::PatExprKind::Lit { lit: self.lower_lit(lit, span), negated: false }
             }
             ExprKind::ConstBlock(c) => hir::PatExprKind::ConstBlock(self.lower_const_block(c)),
-            ExprKind::IncludedBytes(bytes) => hir::PatExprKind::Lit {
-                lit: self
-                    .arena
-                    .alloc(respan(span, LitKind::ByteStr(Arc::clone(bytes), StrStyle::Cooked))),
+            ExprKind::IncludedBytes(byte_sym) => hir::PatExprKind::Lit {
+                lit: respan(span, LitKind::ByteStr(*byte_sym, StrStyle::Cooked)),
                 negated: false,
             },
             ExprKind::Err(guar) => err(*guar),
@@ -464,6 +460,11 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
                         )
                     }),
             ),
+            TyPatKind::Or(variants) => {
+                hir::TyPatKind::Or(self.arena.alloc_from_iter(
+                    variants.iter().map(|pat| self.lower_ty_pat_mut(pat, base_type)),
+                ))
+            }
             TyPatKind::Err(guar) => hir::TyPatKind::Err(*guar),
         };
 
@@ -517,14 +518,13 @@ impl<'a, 'hir> LoweringContext<'a, 'hir> {
         span: Span,
         base_type: Span,
     ) -> &'hir hir::ConstArg<'hir> {
-        let parent_def_id = self.current_hir_id_owner.def_id;
         let node_id = self.next_node_id();
 
         // Add a definition for the in-band const def.
         // We're generating a range end that didn't exist in the AST,
         // so the def collector didn't create the def ahead of time. That's why we have to do
         // it here.
-        let def_id = self.create_def(parent_def_id, node_id, None, DefKind::AnonConst, span);
+        let def_id = self.create_def(node_id, None, DefKind::AnonConst, span);
         let hir_id = self.lower_node_id(node_id);
 
         let unstable_span = self.mark_span_with_reason(

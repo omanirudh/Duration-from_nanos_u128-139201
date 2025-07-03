@@ -191,7 +191,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 let scc = self.constraint_sccs.scc(vid);
 
                 // Special handling of higher-ranked regions.
-                if !self.scc_universe(scc).is_root() {
+                if !self.max_nameable_universe(scc).is_root() {
                     match self.scc_values.placeholders_contained_in(scc).enumerate().last() {
                         // If the region contains a single placeholder then they're equal.
                         Some((0, placeholder)) => {
@@ -215,9 +215,7 @@ impl<'tcx> RegionInferenceContext<'tcx> {
                 // FIXME: We could probably compute the LUB if there is one.
                 let scc = self.constraint_sccs.scc(vid);
                 let upper_bounds: Vec<_> = self
-                    .rev_scc_graph
-                    .as_ref()
-                    .unwrap()
+                    .reverse_scc_graph()
                     .upper_bounds(scc)
                     .filter_map(|vid| self.definitions[vid].external_name)
                     .filter(|r| !r.is_static())
@@ -267,13 +265,13 @@ impl<'tcx> InferCtxt<'tcx> {
             return Ty::new_error(self.tcx, e);
         }
 
-        if let Err(guar) = check_opaque_type_parameter_valid(
+        if let Err(err) = check_opaque_type_parameter_valid(
             self,
             opaque_type_key,
             instantiated_ty.span,
             DefiningScopeKind::MirBorrowck,
         ) {
-            return Ty::new_error(self.tcx, guar);
+            return Ty::new_error(self.tcx, err.report(self));
         }
 
         let definition_ty = instantiated_ty

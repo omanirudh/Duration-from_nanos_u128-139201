@@ -4,12 +4,12 @@ use crate::ffi::{OsStr, OsString};
 use crate::marker::PhantomData;
 use crate::os::xous::ffi::Error as XousError;
 use crate::path::{self, PathBuf};
-use crate::sync::atomic::{AtomicPtr, Ordering};
+use crate::sync::atomic::{Atomic, AtomicPtr, Ordering};
 use crate::{fmt, io};
 
 pub(crate) mod params;
 
-static PARAMS_ADDRESS: AtomicPtr<u8> = AtomicPtr::new(core::ptr::null_mut());
+static PARAMS_ADDRESS: Atomic<*mut u8> = AtomicPtr::new(core::ptr::null_mut());
 
 #[cfg(not(test))]
 #[cfg(feature = "panic_unwind")]
@@ -61,14 +61,6 @@ mod c_compat {
             }
         }
         exit(unsafe { main() });
-    }
-
-    // This function is needed by the panic runtime. The symbol is named in
-    // pre-link args for the target specification, so keep that in sync.
-    #[unsafe(no_mangle)]
-    // NB. used by both libunwind and libpanic_abort
-    pub extern "C" fn __rust_abort() -> ! {
-        exit(101);
     }
 }
 

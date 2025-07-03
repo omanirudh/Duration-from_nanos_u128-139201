@@ -11,7 +11,7 @@ use std::{env, iter, str};
 
 use build_helper::fs::remove_and_create_dir_all;
 use camino::{Utf8Path, Utf8PathBuf};
-use colored::Colorize;
+use colored::{Color, Colorize};
 use regex::{Captures, Regex};
 use tracing::*;
 
@@ -23,11 +23,11 @@ use crate::common::{
     output_base_dir, output_base_name, output_testname_unique,
 };
 use crate::compute_diff::{DiffLine, make_diff, write_diff, write_filtered_diff};
-use crate::errors::{Error, ErrorKind};
-use crate::header::TestProps;
+use crate::directives::TestProps;
+use crate::errors::{Error, ErrorKind, load_errors};
 use crate::read2::{Truncated, read2_abbreviated};
 use crate::util::{Utf8PathBufExt, add_dylib_path, logv, static_regex};
-use crate::{ColorConfig, json, stamp_file_path};
+use crate::{ColorConfig, help, json, stamp_file_path, warning};
 
 mod debugger;
 
@@ -485,12 +485,15 @@ impl<'test> TestCx<'test> {
                 .windows(2)
                 .any(|args| args == cfg_arg || args[0] == arg || args[1] == arg)
             {
-                panic!(
-                    "error: redundant cfg argument `{normalized_revision}` is already created by the revision"
+                error!(
+                    "redundant cfg argument `{normalized_revision}` is already created by the \
+                    revision"
                 );
+                panic!("redundant cfg argument");
             }
             if self.config.builtin_cfg_names().contains(&normalized_revision) {
-                panic!("error: revision `{normalized_revision}` collides with a builtin cfg");
+                error!("revision `{normalized_revision}` collides with a built-in cfg");
+                panic!("revision collides with built-in cfg");
             }
             cmd.args(cfg_arg);
         }
@@ -577,23 +580,9 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_all_error_patterns(
-        &self,
-        output_to_check: &str,
-        proc_res: &ProcRes,
-        pm: Option<PassMode>,
-    ) {
-        if self.props.error_patterns.is_empty() && self.props.regex_error_patterns.is_empty() {
-            if pm.is_some() {
-                // FIXME(#65865)
-                return;
-            } else {
-                self.fatal(&format!("no error pattern specified in {}", self.testpaths.file));
-            }
-        }
-
+    /// Check `error-pattern` and `regex-error-pattern` directives.
+    fn check_all_error_patterns(&self, output_to_check: &str, proc_res: &ProcRes) {
         let mut missing_patterns: Vec<String> = Vec::new();
-
         self.check_error_patterns(output_to_check, &mut missing_patterns);
         self.check_regex_error_patterns(output_to_check, proc_res, &mut missing_patterns);
 
@@ -670,14 +659,14 @@ impl<'test> TestCx<'test> {
         }
     }
 
-    fn check_expected_errors(&self, expected_errors: Vec<Error>, proc_res: &ProcRes) {
+    /// Check `//~ KIND message` annotations.
+    fn check_expected_errors(&self, proc_res: &ProcRes) {
+        let expected_errors = load_errors(&self.testpaths.file, self.revision);
         debug!(
             "check_expected_errors: expected_errors={:?} proc_res.status={:?}",
             expected_errors, proc_res.status
         );
-        if proc_res.status.success()
-            && expected_errors.iter().any(|x| x.kind == Some(ErrorKind::Error))
-        {
+        if proc_res.status.success() && expected_errors.iter().any(|x| x.kind == ErrorKind::Error) {
             self.fatal_proc_rec("process did not return an error status", proc_res);
         }
 
@@ -690,9 +679,6 @@ impl<'test> TestCx<'test> {
             }
             return;
         }
-
-        // On Windows, translate all '\' path separators to '/'
-        let file_name = self.testpaths.file.to_string().replace(r"\", "/");
 
         // On Windows, keep all '\' path separators to match the paths reported in the JSON output
         // from the compiler
@@ -709,22 +695,35 @@ impl<'test> TestCx<'test> {
         // if one of them actually occurs in the test.
         let expected_kinds: HashSet<_> = [ErrorKind::Error, ErrorKind::Warning]
             .into_iter()
-            .chain(expected_errors.iter().filter_map(|e| e.kind))
+            .chain(expected_errors.iter().map(|e| e.kind))
             .collect();
 
         // Parse the JSON output from the compiler and extract out the messages.
-        let actual_errors = json::parse_output(&diagnostic_file_name, &proc_res.stderr, proc_res);
+        let actual_errors = json::parse_output(&diagnostic_file_name, &self.get_output(proc_res))
+            .into_iter()
+            .map(|e| Error { msg: self.normalize_output(&e.msg, &[]), ..e });
+
         let mut unexpected = Vec::new();
+        let mut unimportant = Vec::new();
         let mut found = vec![false; expected_errors.len()];
-        for mut actual_error in actual_errors {
-            actual_error.msg = self.normalize_output(&actual_error.msg, &[]);
+        for actual_error in actual_errors {
+            for pattern in &self.props.error_patterns {
+                let pattern = pattern.trim();
+                if actual_error.msg.contains(pattern) {
+                    let q = if actual_error.line_num.is_none() { "?" } else { "" };
+                    self.fatal(&format!(
+                        "error pattern '{pattern}' is found in structured \
+                         diagnostics, use `//~{q} {} {pattern}` instead",
+                        actual_error.kind,
+                    ));
+                }
+            }
 
             let opt_index =
                 expected_errors.iter().enumerate().position(|(index, expected_error)| {
                     !found[index]
                         && actual_error.line_num == expected_error.line_num
-                        && (expected_error.kind.is_none()
-                            || actual_error.kind == expected_error.kind)
+                        && actual_error.kind == expected_error.kind
                         && actual_error.msg.contains(&expected_error.msg)
                 });
 
@@ -737,22 +736,12 @@ impl<'test> TestCx<'test> {
 
                 None => {
                     if actual_error.require_annotation
-                        && actual_error.kind.map_or(false, |kind| {
-                            expected_kinds.contains(&kind)
-                                && !self.props.dont_require_annotations.contains(&kind)
-                        })
+                        && expected_kinds.contains(&actual_error.kind)
+                        && !self.props.dont_require_annotations.contains(&actual_error.kind)
                     {
-                        self.error(&format!(
-                            "{}:{}: unexpected {}: '{}'",
-                            file_name,
-                            actual_error.line_num_str(),
-                            actual_error
-                                .kind
-                                .as_ref()
-                                .map_or(String::from("message"), |k| k.to_string()),
-                            actual_error.msg
-                        ));
                         unexpected.push(actual_error);
+                    } else {
+                        unimportant.push(actual_error);
                     }
                 }
             }
@@ -762,39 +751,140 @@ impl<'test> TestCx<'test> {
         // anything not yet found is a problem
         for (index, expected_error) in expected_errors.iter().enumerate() {
             if !found[index] {
-                self.error(&format!(
-                    "{}:{}: expected {} not found: {}",
-                    file_name,
-                    expected_error.line_num_str(),
-                    expected_error.kind.as_ref().map_or("message".into(), |k| k.to_string()),
-                    expected_error.msg
-                ));
                 not_found.push(expected_error);
             }
         }
 
         if !unexpected.is_empty() || !not_found.is_empty() {
             self.error(&format!(
-                "{} unexpected errors found, {} expected errors not found",
+                "{} unexpected diagnostics reported, {} expected diagnostics not reported",
                 unexpected.len(),
                 not_found.len()
             ));
-            println!("status: {}\ncommand: {}\n", proc_res.status, proc_res.cmdline);
+
+            // Emit locations in a format that is short (relative paths) but "clickable" in editors.
+            // Also normalize path separators to `/`.
+            let file_name = self
+                .testpaths
+                .file
+                .strip_prefix(self.config.src_root.as_str())
+                .unwrap_or(&self.testpaths.file)
+                .to_string()
+                .replace(r"\", "/");
+            let line_str = |e: &Error| {
+                let line_num = e.line_num.map_or("?".to_string(), |line_num| line_num.to_string());
+                // `file:?:NUM` may be confusing to editors and unclickable.
+                let opt_col_num = match e.column_num {
+                    Some(col_num) if line_num != "?" => format!(":{col_num}"),
+                    _ => "".to_string(),
+                };
+                format!("{file_name}:{line_num}{opt_col_num}")
+            };
+            let print_error = |e| println!("{}: {}: {}", line_str(e), e.kind, e.msg.cyan());
+            let push_suggestion =
+                |suggestions: &mut Vec<_>, e: &Error, kind, line, msg, color, rank| {
+                    let mut ret = String::new();
+                    if kind {
+                        ret += &format!("{} {}", "with kind".color(color), e.kind);
+                    }
+                    if line {
+                        if !ret.is_empty() {
+                            ret.push(' ');
+                        }
+                        ret += &format!("{} {}", "on line".color(color), line_str(e));
+                    }
+                    if msg {
+                        if !ret.is_empty() {
+                            ret.push(' ');
+                        }
+                        ret += &format!("{} {}", "with message".color(color), e.msg.cyan());
+                    }
+                    suggestions.push((ret, rank));
+                };
+            let show_suggestions = |mut suggestions: Vec<_>, prefix: &str, color| {
+                // Only show suggestions with the highest rank.
+                suggestions.sort_by_key(|(_, rank)| *rank);
+                if let Some(&(_, top_rank)) = suggestions.first() {
+                    for (suggestion, rank) in suggestions {
+                        if rank == top_rank {
+                            println!("  {} {suggestion}", prefix.color(color));
+                        }
+                    }
+                }
+            };
+
+            // Fuzzy matching quality:
+            // - message and line / message and kind - great, suggested
+            // - only message - good, suggested
+            // - known line and kind - ok, suggested
+            // - only known line - meh, but suggested
+            // - others are not worth suggesting
             if !unexpected.is_empty() {
-                println!("{}", "--- unexpected errors (from JSON output) ---".green());
+                let header = "--- reported in JSON output but not expected in test file ---";
+                println!("{}", header.green());
                 for error in &unexpected {
-                    println!("{}", error.render_for_expected());
+                    print_error(error);
+                    let mut suggestions = Vec::new();
+                    for candidate in &not_found {
+                        let mut push_red_suggestion = |line, msg, rank| {
+                            push_suggestion(
+                                &mut suggestions,
+                                candidate,
+                                candidate.kind != error.kind,
+                                line,
+                                msg,
+                                Color::Red,
+                                rank,
+                            )
+                        };
+                        if error.msg.contains(&candidate.msg) {
+                            push_red_suggestion(candidate.line_num != error.line_num, false, 0);
+                        } else if candidate.line_num.is_some()
+                            && candidate.line_num == error.line_num
+                        {
+                            push_red_suggestion(false, true, 1);
+                        }
+                    }
+
+                    show_suggestions(suggestions, "expected", Color::Red);
                 }
                 println!("{}", "---".green());
             }
             if !not_found.is_empty() {
-                println!("{}", "--- not found errors (from test file) ---".red());
+                let header = "--- expected in test file but not reported in JSON output ---";
+                println!("{}", header.red());
                 for error in &not_found {
-                    println!("{}", error.render_for_expected());
+                    print_error(error);
+                    let mut suggestions = Vec::new();
+                    for candidate in unexpected.iter().chain(&unimportant) {
+                        let mut push_green_suggestion = |line, msg, rank| {
+                            push_suggestion(
+                                &mut suggestions,
+                                candidate,
+                                candidate.kind != error.kind,
+                                line,
+                                msg,
+                                Color::Green,
+                                rank,
+                            )
+                        };
+                        if candidate.msg.contains(&error.msg) {
+                            push_green_suggestion(candidate.line_num != error.line_num, false, 0);
+                        } else if candidate.line_num.is_some()
+                            && candidate.line_num == error.line_num
+                        {
+                            push_green_suggestion(false, true, 1);
+                        }
+                    }
+
+                    show_suggestions(suggestions, "reported", Color::Green);
                 }
-                println!("{}", "---\n".red());
+                println!("{}", "---".red());
             }
-            panic!("errors differ from expected");
+            panic!(
+                "errors differ from expected\nstatus: {}\ncommand: {}\n",
+                proc_res.status, proc_res.cmdline
+            );
         }
     }
 
@@ -1590,7 +1680,10 @@ impl<'test> TestCx<'test> {
             Crashes => {
                 set_mir_dump_dir(&mut rustc);
             }
-            Pretty | DebugInfo | Rustdoc | RustdocJson | RunMake | CodegenUnits | RustdocJs => {
+            CodegenUnits => {
+                rustc.arg("-Zprint-mono-items");
+            }
+            Pretty | DebugInfo | Rustdoc | RustdocJson | RunMake | RustdocJs => {
                 // do not use JSON output
             }
         }
@@ -1946,7 +2039,7 @@ impl<'test> TestCx<'test> {
         // Provide more context on failures.
         filecheck.args(&["--dump-input-context", "100"]);
 
-        // Add custom flags supplied by the `filecheck-flags:` test header.
+        // Add custom flags supplied by the `filecheck-flags:` test directive.
         filecheck.args(&self.props.filecheck_flags);
 
         // FIXME(jieyouxu): don't pass an empty Path
@@ -2077,10 +2170,10 @@ impl<'test> TestCx<'test> {
             println!("{}", String::from_utf8_lossy(&output.stdout));
             eprintln!("{}", String::from_utf8_lossy(&output.stderr));
         } else {
-            use colored::Colorize;
-            eprintln!("warning: no pager configured, falling back to unified diff");
-            eprintln!(
-                "help: try configuring a git pager (e.g. `delta`) with `git config --global core.pager delta`"
+            warning!("no pager configured, falling back to unified diff");
+            help!(
+                "try configuring a git pager (e.g. `delta`) with \
+                `git config --global core.pager delta`"
             );
             let mut out = io::stdout();
             let mut diff = BufReader::new(File::open(&diff_filename).unwrap());
@@ -2372,8 +2465,15 @@ impl<'test> TestCx<'test> {
         // Real paths into the libstd/libcore
         let rust_src_dir = &self.config.sysroot_base.join("lib/rustlib/src/rust");
         rust_src_dir.try_exists().expect(&*format!("{} should exists", rust_src_dir));
-        let rust_src_dir = rust_src_dir.read_link_utf8().unwrap_or(rust_src_dir.to_path_buf());
+        let rust_src_dir =
+            rust_src_dir.read_link_utf8().unwrap_or_else(|_| rust_src_dir.to_path_buf());
         normalize_path(&rust_src_dir.join("library"), "$SRC_DIR_REAL");
+
+        // Real paths into the compiler
+        let rustc_src_dir = &self.config.sysroot_base.join("lib/rustlib/rustc-src/rust");
+        rustc_src_dir.try_exists().expect(&*format!("{} should exists", rustc_src_dir));
+        let rustc_src_dir = rustc_src_dir.read_link_utf8().unwrap_or(rustc_src_dir.to_path_buf());
+        normalize_path(&rustc_src_dir.join("compiler"), "$COMPILER_DIR_REAL");
 
         // eg.
         // /home/user/rust/build/x86_64-unknown-linux-gnu/test/ui/<test_dir>/$name.$revision.$mode/
@@ -2613,18 +2713,19 @@ impl<'test> TestCx<'test> {
             (expected, actual)
         };
 
-        // Write the actual output to a file in build/
-        let test_name = self.config.compare_mode.as_ref().map_or("", |m| m.to_str());
+        // Write the actual output to a file in build directory.
         let actual_path = self
             .output_base_name()
             .with_extra_extension(self.revision.unwrap_or(""))
-            .with_extra_extension(test_name)
+            .with_extra_extension(
+                self.config.compare_mode.as_ref().map(|cm| cm.to_str()).unwrap_or(""),
+            )
             .with_extra_extension(stream);
 
         if let Err(err) = fs::write(&actual_path, &actual) {
-            self.fatal(&format!("failed to write {stream} to `{actual_path:?}`: {err}",));
+            self.fatal(&format!("failed to write {stream} to `{actual_path}`: {err}",));
         }
-        println!("Saved the actual {stream} to {actual_path:?}");
+        println!("Saved the actual {stream} to `{actual_path}`");
 
         if !self.config.bless {
             if expected.is_empty() {
@@ -2650,13 +2751,16 @@ impl<'test> TestCx<'test> {
 
             if !actual.is_empty() {
                 if let Err(err) = fs::write(&expected_path, &actual) {
-                    self.fatal(&format!("failed to write {stream} to `{expected_path:?}`: {err}"));
+                    self.fatal(&format!("failed to write {stream} to `{expected_path}`: {err}"));
                 }
-                println!("Blessing the {stream} of {test_name} in {expected_path:?}");
+                println!(
+                    "Blessing the {stream} of `{test_name}` as `{expected_path}`",
+                    test_name = self.testpaths.file
+                );
             }
         }
 
-        println!("\nThe actual {0} differed from the expected {0}.", stream);
+        println!("\nThe actual {stream} differed from the expected {stream}");
 
         if self.config.bless { CompareOutcome::Blessed } else { CompareOutcome::Differed }
     }

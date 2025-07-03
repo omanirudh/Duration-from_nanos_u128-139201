@@ -19,7 +19,8 @@ use rustc_session::cstore::ExternCrate;
 use rustc_span::Span;
 
 use crate::errors::{
-    DuplicateLangItem, IncorrectTarget, LangItemOnIncorrectTarget, UnknownLangItem,
+    DuplicateLangItem, IncorrectCrateType, IncorrectTarget, LangItemOnIncorrectTarget,
+    UnknownLangItem,
 };
 use crate::weak_lang_items;
 
@@ -236,6 +237,10 @@ impl<'ast, 'tcx> LanguageItemCollector<'ast, 'tcx> {
             }
         }
 
+        if self.tcx.crate_types().contains(&rustc_session::config::CrateType::Sdylib) {
+            self.tcx.dcx().emit_err(IncorrectCrateType { span: attr_span });
+        }
+
         self.collect_item(lang_item, item_def_id.to_def_id(), Some(item_span));
     }
 }
@@ -302,18 +307,14 @@ impl<'ast, 'tcx> visit::Visitor<'ast> for LanguageItemCollector<'ast, 'tcx> {
         self.parent_item = parent_item;
     }
 
-    fn visit_enum_def(&mut self, enum_definition: &'ast ast::EnumDef) {
-        for variant in &enum_definition.variants {
-            self.check_for_lang(
-                Target::Variant,
-                self.resolver.node_id_to_def_id[&variant.id],
-                &variant.attrs,
-                variant.span,
-                None,
-            );
-        }
-
-        visit::walk_enum_def(self, enum_definition);
+    fn visit_variant(&mut self, variant: &'ast ast::Variant) {
+        self.check_for_lang(
+            Target::Variant,
+            self.resolver.node_id_to_def_id[&variant.id],
+            &variant.attrs,
+            variant.span,
+            None,
+        );
     }
 
     fn visit_assoc_item(&mut self, i: &'ast ast::AssocItem, ctxt: visit::AssocCtxt) {

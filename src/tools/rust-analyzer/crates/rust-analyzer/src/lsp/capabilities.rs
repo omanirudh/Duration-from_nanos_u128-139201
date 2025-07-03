@@ -1,6 +1,6 @@
 //! Advertises the capabilities of the LSP Server.
 use ide::{CompletionFieldsToResolve, InlayFieldsToResolve};
-use ide_db::{line_index::WideEncoding, FxHashSet};
+use ide_db::{FxHashSet, line_index::WideEncoding};
 use lsp_types::{
     CallHierarchyServerCapability, CodeActionKind, CodeActionOptions, CodeActionProviderCapability,
     CodeLensOptions, CompletionOptions, CompletionOptionsCompletionItem, DeclarationCapability,
@@ -77,7 +77,7 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             _ => Some(OneOf::Left(false)),
         },
         document_on_type_formatting_provider: Some({
-            let mut chars = ide::Analysis::SUPPORTED_TRIGGER_CHARS.chars();
+            let mut chars = ide::Analysis::SUPPORTED_TRIGGER_CHARS.iter();
             DocumentOnTypeFormattingOptions {
                 first_trigger_character: chars.next().unwrap().to_string(),
                 more_trigger_character: Some(chars.map(|c| c.to_string()).collect()),
@@ -157,6 +157,7 @@ pub fn server_capabilities(config: &Config) -> ServerCapabilities {
             "onEnter": true,
             "openCargoToml": true,
             "parentModule": true,
+            "childModules": true,
             "runnables": {
                 "kinds": [ "cargo" ],
             },

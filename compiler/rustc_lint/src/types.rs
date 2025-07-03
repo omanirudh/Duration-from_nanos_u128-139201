@@ -1,9 +1,7 @@
 use std::iter;
 use std::ops::ControlFlow;
 
-use rustc_abi::{
-    BackendRepr, Integer, IntegerType, TagEncoding, VariantIdx, Variants, WrappingRange,
-};
+use rustc_abi::{BackendRepr, TagEncoding, VariantIdx, Variants, WrappingRange};
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::DiagMessage;
 use rustc_hir::intravisit::VisitorExt;
@@ -24,7 +22,8 @@ mod improper_ctypes;
 
 use crate::lints::{
     AmbiguousWidePointerComparisons, AmbiguousWidePointerComparisonsAddrMetadataSuggestion,
-    AmbiguousWidePointerComparisonsAddrSuggestion, AtomicOrderingFence, AtomicOrderingLoad,
+    AmbiguousWidePointerComparisonsAddrSuggestion, AmbiguousWidePointerComparisonsCastSuggestion,
+    AmbiguousWidePointerComparisonsExpectSuggestion, AtomicOrderingFence, AtomicOrderingLoad,
     AtomicOrderingStore, ImproperCTypes, InvalidAtomicOrderingDiag, InvalidNanComparisons,
     InvalidNanComparisonsSuggestion, UnpredictableFunctionPointerComparisons,
     UnpredictableFunctionPointerComparisonsSuggestion, UnusedComparisons, UsesPowerAlignment,
@@ -197,7 +196,8 @@ declare_lint! {
     /// same address after being merged together.
     UNPREDICTABLE_FUNCTION_POINTER_COMPARISONS,
     Warn,
-    "detects unpredictable function pointer comparisons"
+    "detects unpredictable function pointer comparisons",
+    report_in_external_macro
 }
 
 #[derive(Copy, Clone, Default)]
@@ -362,6 +362,7 @@ fn lint_wide_pointer<'tcx>(
     let ne = if cmpop == ComparisonOp::BinOp(hir::BinOpKind::Ne) { "!" } else { "" };
     let is_eq_ne = matches!(cmpop, ComparisonOp::BinOp(hir::BinOpKind::Eq | hir::BinOpKind::Ne));
     let is_dyn_comparison = l_inner_ty_is_dyn && r_inner_ty_is_dyn;
+    let via_method_call = matches!(&e.kind, ExprKind::MethodCall(..) | ExprKind::Call(..));
 
     let left = e.span.shrink_to_lo().until(l_span.shrink_to_lo());
     let middle = l_span.shrink_to_hi().until(r_span.shrink_to_lo());
@@ -376,9 +377,21 @@ fn lint_wide_pointer<'tcx>(
     cx.emit_span_lint(
         AMBIGUOUS_WIDE_POINTER_COMPARISONS,
         e.span,
-        AmbiguousWidePointerComparisons::Spanful {
-            addr_metadata_suggestion: (is_eq_ne && !is_dyn_comparison).then(|| {
-                AmbiguousWidePointerComparisonsAddrMetadataSuggestion {
+        if is_eq_ne {
+            AmbiguousWidePointerComparisons::SpanfulEq {
+                addr_metadata_suggestion: (!is_dyn_comparison).then(|| {
+                    AmbiguousWidePointerComparisonsAddrMetadataSuggestion {
+                        ne,
+                        deref_left,
+                        deref_right,
+                        l_modifiers,
+                        r_modifiers,
+                        left,
+                        middle,
+                        right,
+                    }
+                }),
+                addr_suggestion: AmbiguousWidePointerComparisonsAddrSuggestion {
                     ne,
                     deref_left,
                     deref_right,
@@ -387,21 +400,11 @@ fn lint_wide_pointer<'tcx>(
                     left,
                     middle,
                     right,
-                }
-            }),
-            addr_suggestion: if is_eq_ne {
-                AmbiguousWidePointerComparisonsAddrSuggestion::AddrEq {
-                    ne,
-                    deref_left,
-                    deref_right,
-                    l_modifiers,
-                    r_modifiers,
-                    left,
-                    middle,
-                    right,
-                }
-            } else {
-                AmbiguousWidePointerComparisonsAddrSuggestion::Cast {
+                },
+            }
+        } else {
+            AmbiguousWidePointerComparisons::SpanfulCmp {
+                cast_suggestion: AmbiguousWidePointerComparisonsCastSuggestion {
                     deref_left,
                     deref_right,
                     l_modifiers,
@@ -412,8 +415,14 @@ fn lint_wide_pointer<'tcx>(
                     left_after: l_span.shrink_to_hi(),
                     right_before: (r_ty_refs != 0).then_some(r_span.shrink_to_lo()),
                     right_after: r_span.shrink_to_hi(),
-                }
-            },
+                },
+                expect_suggestion: AmbiguousWidePointerComparisonsExpectSuggestion {
+                    paren_left: if via_method_call { "" } else { "(" },
+                    paren_right: if via_method_call { "" } else { ")" },
+                    before: e.span.shrink_to_lo(),
+                    after: e.span.shrink_to_hi(),
+                },
+            }
         },
     );
 }
@@ -538,18 +547,12 @@ fn lint_fn_pointer<'tcx>(
 }
 
 impl<'tcx> LateLintPass<'tcx> for TypeLimits {
-    fn check_lit(
-        &mut self,
-        cx: &LateContext<'tcx>,
-        hir_id: HirId,
-        lit: &'tcx hir::Lit,
-        negated: bool,
-    ) {
+    fn check_lit(&mut self, cx: &LateContext<'tcx>, hir_id: HirId, lit: hir::Lit, negated: bool) {
         if negated {
             self.negated_expr_id = Some(hir_id);
             self.negated_expr_span = Some(lit.span);
         }
-        lint_literal(cx, self, hir_id, lit.span, lit, negated);
+        lint_literal(cx, self, hir_id, lit.span, &lit, negated);
     }
 
     fn check_expr(&mut self, cx: &LateContext<'tcx>, e: &'tcx hir::Expr<'tcx>) {
@@ -755,10 +758,10 @@ declare_lint! {
     /// *subsequent* fields of the associated structs to use an alignment value
     /// where the floating-point type is aligned on a 4-byte boundary.
     ///
-    /// The power alignment rule for structs needed for C compatibility is
-    /// unimplementable within `repr(C)` in the compiler without building in
-    /// handling of references to packed fields and infectious nested layouts,
-    /// so a warning is produced in these situations.
+    /// Effectively, subsequent floating-point fields act as-if they are `repr(packed(4))`. This
+    /// would be unsound to do in a `repr(C)` type without all the restrictions that come with
+    /// `repr(packed)`. Rust instead chooses a layout that maintains soundness of Rust code, at the
+    /// expense of incompatibility with C code.
     ///
     /// ### Example
     ///
@@ -790,8 +793,10 @@ declare_lint! {
     ///  - offset_of!(Floats, a) == 0
     ///  - offset_of!(Floats, b) == 8
     ///  - offset_of!(Floats, c) == 12
-    /// However, rust currently aligns `c` at offset_of!(Floats, c) == 16.
-    /// Thus, a warning should be produced for the above struct in this case.
+    ///
+    /// However, Rust currently aligns `c` at `offset_of!(Floats, c) == 16`.
+    /// Using offset 12 would be unsound since `f64` generally must be 8-aligned on this target.
+    /// Thus, a warning is produced for the above struct.
     USES_POWER_ALIGNMENT,
     Warn,
     "Structs do not follow the power alignment rule under repr(C)"
@@ -878,23 +883,34 @@ fn ty_is_known_nonnull<'tcx>(
         }
         ty::Pat(base, pat) => {
             ty_is_known_nonnull(tcx, typing_env, *base, mode)
-                || Option::unwrap_or_default(
-                    try {
-                        match **pat {
-                            ty::PatternKind::Range { start, end } => {
-                                let start = start.try_to_value()?.try_to_bits(tcx, typing_env)?;
-                                let end = end.try_to_value()?.try_to_bits(tcx, typing_env)?;
-
-                                // This also works for negative numbers, as we just need
-                                // to ensure we aren't wrapping over zero.
-                                start > 0 && end >= start
-                            }
-                        }
-                    },
-                )
+                || pat_ty_is_known_nonnull(tcx, typing_env, *pat)
         }
         _ => false,
     }
+}
+
+fn pat_ty_is_known_nonnull<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    pat: ty::Pattern<'tcx>,
+) -> bool {
+    Option::unwrap_or_default(
+        try {
+            match *pat {
+                ty::PatternKind::Range { start, end } => {
+                    let start = start.try_to_value()?.try_to_bits(tcx, typing_env)?;
+                    let end = end.try_to_value()?.try_to_bits(tcx, typing_env)?;
+
+                    // This also works for negative numbers, as we just need
+                    // to ensure we aren't wrapping over zero.
+                    start > 0 && end >= start
+                }
+                ty::PatternKind::Or(patterns) => {
+                    patterns.iter().all(|pat| pat_ty_is_known_nonnull(tcx, typing_env, pat))
+                }
+            }
+        },
+    )
 }
 
 /// Given a non-null scalar (or transparent) type `ty`, return the nullable version of that type.
@@ -1038,10 +1054,26 @@ pub(crate) fn repr_nullable_ptr<'tcx>(
             }
             None
         }
-        ty::Pat(base, pat) => match **pat {
-            ty::PatternKind::Range { .. } => get_nullable_type(tcx, typing_env, *base),
-        },
+        ty::Pat(base, pat) => get_nullable_type_from_pat(tcx, typing_env, *base, *pat),
         _ => None,
+    }
+}
+
+fn get_nullable_type_from_pat<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    typing_env: ty::TypingEnv<'tcx>,
+    base: Ty<'tcx>,
+    pat: ty::Pattern<'tcx>,
+) -> Option<Ty<'tcx>> {
+    match *pat {
+        ty::PatternKind::Range { .. } => get_nullable_type(tcx, typing_env, base),
+        ty::PatternKind::Or(patterns) => {
+            let first = get_nullable_type_from_pat(tcx, typing_env, base, patterns[0])?;
+            for &pat in &patterns[1..] {
+                assert_eq!(first, get_nullable_type_from_pat(tcx, typing_env, base, pat)?);
+            }
+            Some(first)
+        }
     }
 }
 
@@ -1245,14 +1277,6 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                             };
                         }
 
-                        if let Some(IntegerType::Fixed(Integer::I128, _)) = def.repr().int {
-                            return FfiUnsafe {
-                                ty,
-                                reason: fluent::lint_improper_ctypes_128bit,
-                                help: None,
-                            };
-                        }
-
                         use improper_ctypes::check_non_exhaustive_variant;
 
                         let non_exhaustive = def.variant_list_has_applicable_non_exhaustive();
@@ -1284,10 +1308,6 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             // It's just extra invariants on the type that you need to uphold,
             // but only the base type is relevant for being representable in FFI.
             ty::Pat(base, ..) => self.check_type_for_ffi(acc, base),
-
-            ty::Int(ty::IntTy::I128) | ty::Uint(ty::UintTy::U128) => {
-                FfiUnsafe { ty, reason: fluent::lint_improper_ctypes_128bit, help: None }
-            }
 
             // Primitive types with a stable representation.
             ty::Bool | ty::Int(..) | ty::Uint(..) | ty::Float(..) | ty::Never => FfiSafe,
@@ -1381,7 +1401,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
             ty::UnsafeBinder(_) => todo!("FIXME(unsafe_binder)"),
 
             ty::Param(..)
-            | ty::Alias(ty::Projection | ty::Inherent | ty::Weak, ..)
+            | ty::Alias(ty::Projection | ty::Inherent | ty::Free, ..)
             | ty::Infer(..)
             | ty::Bound(..)
             | ty::Error(_)
@@ -1628,15 +1648,13 @@ impl ImproperCTypesDefinitions {
         cx: &LateContext<'tcx>,
         ty: Ty<'tcx>,
     ) -> bool {
+        assert!(cx.tcx.sess.target.os == "aix");
         // Structs (under repr(C)) follow the power alignment rule if:
         //   - the first field of the struct is a floating-point type that
         //     is greater than 4-bytes, or
         //   - the first field of the struct is an aggregate whose
         //     recursively first field is a floating-point type greater than
         //     4 bytes.
-        if cx.tcx.sess.target.os != "aix" {
-            return false;
-        }
         if ty.is_floating_point() && ty.primitive_size(cx.tcx).bytes() > 4 {
             return true;
         } else if let Adt(adt_def, _) = ty.kind()
@@ -1673,22 +1691,15 @@ impl ImproperCTypesDefinitions {
             && cx.tcx.sess.target.os == "aix"
             && !adt_def.all_fields().next().is_none()
         {
-            let struct_variant_data = item.expect_struct().1;
-            for (index, ..) in struct_variant_data.fields().iter().enumerate() {
+            let struct_variant_data = item.expect_struct().2;
+            for field_def in struct_variant_data.fields().iter().skip(1) {
                 // Struct fields (after the first field) are checked for the
                 // power alignment rule, as fields after the first are likely
                 // to be the fields that are misaligned.
-                if index != 0 {
-                    let first_field_def = struct_variant_data.fields()[index];
-                    let def_id = first_field_def.def_id;
-                    let ty = cx.tcx.type_of(def_id).instantiate_identity();
-                    if self.check_arg_for_power_alignment(cx, ty) {
-                        cx.emit_span_lint(
-                            USES_POWER_ALIGNMENT,
-                            first_field_def.span,
-                            UsesPowerAlignment,
-                        );
-                    }
+                let def_id = field_def.def_id;
+                let ty = cx.tcx.type_of(def_id).instantiate_identity();
+                if self.check_arg_for_power_alignment(cx, ty) {
+                    cx.emit_span_lint(USES_POWER_ALIGNMENT, field_def.span, UsesPowerAlignment);
                 }
             }
         }
@@ -1705,9 +1716,9 @@ impl ImproperCTypesDefinitions {
 impl<'tcx> LateLintPass<'tcx> for ImproperCTypesDefinitions {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx hir::Item<'tcx>) {
         match item.kind {
-            hir::ItemKind::Static(_, ty, ..)
-            | hir::ItemKind::Const(_, ty, ..)
-            | hir::ItemKind::TyAlias(_, ty, ..) => {
+            hir::ItemKind::Static(_, _, ty, _)
+            | hir::ItemKind::Const(_, _, ty, _)
+            | hir::ItemKind::TyAlias(_, _, ty) => {
                 self.check_ty_maybe_containing_foreign_fnptr(
                     cx,
                     ty,
@@ -1774,7 +1785,7 @@ declare_lint_pass!(VariantSizeDifferences => [VARIANT_SIZE_DIFFERENCES]);
 
 impl<'tcx> LateLintPass<'tcx> for VariantSizeDifferences {
     fn check_item(&mut self, cx: &LateContext<'_>, it: &hir::Item<'_>) {
-        if let hir::ItemKind::Enum(_, ref enum_definition, _) = it.kind {
+        if let hir::ItemKind::Enum(_, _, ref enum_definition) = it.kind {
             let t = cx.tcx.type_of(it.owner_id).instantiate_identity();
             let ty = cx.tcx.erase_regions(t);
             let Ok(layout) = cx.layout_of(ty) else { return };

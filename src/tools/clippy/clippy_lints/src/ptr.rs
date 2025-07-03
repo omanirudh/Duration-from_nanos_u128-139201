@@ -2,7 +2,7 @@ use clippy_utils::diagnostics::{span_lint_and_sugg, span_lint_and_then, span_lin
 use clippy_utils::source::SpanRangeExt;
 use clippy_utils::sugg::Sugg;
 use clippy_utils::visitors::contains_unsafe_block;
-use clippy_utils::{get_expr_use_or_unification_node, is_lint_allowed, path_def_id, path_to_local, std_or_core};
+use clippy_utils::{get_expr_use_or_unification_node, is_lint_allowed, path_def_id, path_to_local, std_or_core, sym};
 use hir::LifetimeKind;
 use rustc_abi::ExternAbi;
 use rustc_errors::{Applicability, MultiSpan};
@@ -18,8 +18,8 @@ use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::{self, Binder, ClauseKind, ExistentialPredicate, List, PredicateKind, Ty};
 use rustc_session::declare_lint_pass;
+use rustc_span::Span;
 use rustc_span::symbol::Symbol;
-use rustc_span::{Span, sym};
 use rustc_trait_selection::infer::InferCtxtExt as _;
 use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
 use std::{fmt, iter};
@@ -268,6 +268,7 @@ impl<'tcx> LateLintPass<'tcx> for Ptr {
                 (false, false, true) if let Some(sugg) = Sugg::hir_opt(cx, l) => sugg.maybe_paren(),
                 _ => return check_ptr_eq(cx, expr, op.node, l, r),
             };
+            let invert = if op.node == BinOpKind::Eq { "" } else { "!" };
 
             span_lint_and_sugg(
                 cx,
@@ -275,7 +276,7 @@ impl<'tcx> LateLintPass<'tcx> for Ptr {
                 expr.span,
                 "comparing with null is better expressed by the `.is_null()` method",
                 "try",
-                format!("{non_null_path_snippet}.is_null()"),
+                format!("{invert}{non_null_path_snippet}.is_null()",),
                 Applicability::MachineApplicable,
             );
         }
@@ -299,7 +300,7 @@ struct PtrArg<'tcx> {
     emission_id: HirId,
     span: Span,
     ty_name: Symbol,
-    method_renames: &'static [(&'static str, &'static str)],
+    method_renames: &'static [(Symbol, &'static str)],
     ref_prefix: RefPrefix,
     deref_ty: DerefTy<'tcx>,
 }
@@ -385,6 +386,7 @@ impl<'tcx> DerefTy<'tcx> {
     }
 }
 
+#[expect(clippy::too_many_lines)]
 fn check_fn_args<'cx, 'tcx: 'cx>(
     cx: &'cx LateContext<'tcx>,
     fn_sig: ty::FnSig<'tcx>,
@@ -409,7 +411,7 @@ fn check_fn_args<'cx, 'tcx: 'cx>(
                 let emission_id = params.get(i).map_or(hir_ty.hir_id, |param| param.hir_id);
                 let (method_renames, deref_ty) = match cx.tcx.get_diagnostic_name(adt.did()) {
                     Some(sym::Vec) => (
-                        [("clone", ".to_owned()")].as_slice(),
+                        [(sym::clone, ".to_owned()")].as_slice(),
                         DerefTy::Slice(
                             name.args.and_then(|args| args.args.first()).and_then(|arg| {
                                 if let GenericArg::Type(ty) = arg {
@@ -421,10 +423,14 @@ fn check_fn_args<'cx, 'tcx: 'cx>(
                             args.type_at(0),
                         ),
                     ),
-                    _ if Some(adt.did()) == cx.tcx.lang_items().string() => {
-                        ([("clone", ".to_owned()"), ("as_str", "")].as_slice(), DerefTy::Str)
-                    },
-                    Some(sym::PathBuf) => ([("clone", ".to_path_buf()"), ("as_path", "")].as_slice(), DerefTy::Path),
+                    _ if Some(adt.did()) == cx.tcx.lang_items().string() => (
+                        [(sym::clone, ".to_owned()"), (sym::as_str, "")].as_slice(),
+                        DerefTy::Str,
+                    ),
+                    Some(sym::PathBuf) => (
+                        [(sym::clone, ".to_path_buf()"), (sym::as_path, "")].as_slice(),
+                        DerefTy::Path,
+                    ),
                     Some(sym::Cow) if mutability == Mutability::Not => {
                         if let Some((lifetime, ty)) = name.args.and_then(|args| {
                             if let [GenericArg::Lifetime(lifetime), ty] = args.args {
@@ -595,7 +601,7 @@ fn check_ptr_arg_usage<'tcx>(cx: &LateContext<'tcx>, body: &Body<'tcx>, args: &[
                     if let ExprKind::MethodCall(name, receiver, ..) = use_expr.kind
                         && receiver.hir_id == child_id
                     {
-                        let name = name.ident.as_str();
+                        let name = name.ident.name;
 
                         // Check if the method can be renamed.
                         if let Some((_, replacement)) = args.method_renames.iter().find(|&&(x, _)| x == name) {
@@ -743,9 +749,9 @@ fn check_ptr_eq<'tcx>(
     }
 
     // Remove one level of usize conversion if any
-    let (left, right) = match (expr_as_cast_to_usize(cx, left), expr_as_cast_to_usize(cx, right)) {
-        (Some(lhs), Some(rhs)) => (lhs, rhs),
-        _ => (left, right),
+    let (left, right, usize_peeled) = match (expr_as_cast_to_usize(cx, left), expr_as_cast_to_usize(cx, right)) {
+        (Some(lhs), Some(rhs)) => (lhs, rhs, true),
+        _ => (left, right, false),
     };
 
     // This lint concerns raw pointers
@@ -754,7 +760,12 @@ fn check_ptr_eq<'tcx>(
         return;
     }
 
-    let (left_var, right_var) = (peel_raw_casts(cx, left, left_ty), peel_raw_casts(cx, right, right_ty));
+    let ((left_var, left_casts_peeled), (right_var, right_casts_peeled)) =
+        (peel_raw_casts(cx, left, left_ty), peel_raw_casts(cx, right, right_ty));
+
+    if !(usize_peeled || left_casts_peeled || right_casts_peeled) {
+        return;
+    }
 
     let mut app = Applicability::MachineApplicable;
     let left_snip = Sugg::hir_with_context(cx, left_var, expr.span.ctxt(), "_", &mut app);
@@ -787,8 +798,9 @@ fn expr_as_cast_to_usize<'tcx>(cx: &LateContext<'tcx>, cast_expr: &'tcx Expr<'_>
     }
 }
 
-// Peel raw casts if the remaining expression can be coerced to it
-fn peel_raw_casts<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, expr_ty: Ty<'tcx>) -> &'tcx Expr<'tcx> {
+// Peel raw casts if the remaining expression can be coerced to it, and whether casts have been
+// peeled or not.
+fn peel_raw_casts<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, expr_ty: Ty<'tcx>) -> (&'tcx Expr<'tcx>, bool) {
     if !expr.span.from_expansion()
         && let ExprKind::Cast(inner, _) = expr.kind
         && let ty::RawPtr(target_ty, _) = expr_ty.kind()
@@ -796,8 +808,8 @@ fn peel_raw_casts<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>, expr_ty:
         && let ty::RawPtr(inner_target_ty, _) | ty::Ref(_, inner_target_ty, _) = inner_ty.kind()
         && target_ty == inner_target_ty
     {
-        peel_raw_casts(cx, inner, inner_ty)
+        (peel_raw_casts(cx, inner, inner_ty).0, true)
     } else {
-        expr
+        (expr, false)
     }
 }

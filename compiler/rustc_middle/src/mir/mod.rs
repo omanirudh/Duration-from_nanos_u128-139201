@@ -200,7 +200,13 @@ pub struct CoroutineInfo<'tcx> {
     /// Coroutine drop glue. This field is populated after the state transform pass.
     pub coroutine_drop: Option<Body<'tcx>>,
 
-    /// The layout of a coroutine. This field is populated after the state transform pass.
+    /// Coroutine async drop glue.
+    pub coroutine_drop_async: Option<Body<'tcx>>,
+
+    /// When coroutine has sync drop, this is async proxy calling `coroutine_drop` sync impl.
+    pub coroutine_drop_proxy_async: Option<Body<'tcx>>,
+
+    /// The layout of a coroutine. Produced by the state transformation.
     pub coroutine_layout: Option<CoroutineLayout<'tcx>>,
 
     /// If this is a coroutine then record the type of source expression that caused this coroutine
@@ -220,6 +226,8 @@ impl<'tcx> CoroutineInfo<'tcx> {
             yield_ty: Some(yield_ty),
             resume_ty: Some(resume_ty),
             coroutine_drop: None,
+            coroutine_drop_async: None,
+            coroutine_drop_proxy_async: None,
             coroutine_layout: None,
         }
     }
@@ -254,7 +262,7 @@ pub struct Body<'tcx> {
     /// us to see the difference and forego optimization on the inlined promoted items.
     pub phase: MirPhase,
 
-    /// How many passses we have executed since starting the current phase. Used for debug output.
+    /// How many passes we have executed since starting the current phase. Used for debug output.
     pub pass_count: usize,
 
     pub source: MirSource<'tcx>,
@@ -585,6 +593,26 @@ impl<'tcx> Body<'tcx> {
     #[inline]
     pub fn coroutine_drop(&self) -> Option<&Body<'tcx>> {
         self.coroutine.as_ref().and_then(|coroutine| coroutine.coroutine_drop.as_ref())
+    }
+
+    #[inline]
+    pub fn coroutine_drop_async(&self) -> Option<&Body<'tcx>> {
+        self.coroutine.as_ref().and_then(|coroutine| coroutine.coroutine_drop_async.as_ref())
+    }
+
+    #[inline]
+    pub fn coroutine_requires_async_drop(&self) -> bool {
+        self.coroutine_drop_async().is_some()
+    }
+
+    #[inline]
+    pub fn future_drop_poll(&self) -> Option<&Body<'tcx>> {
+        self.coroutine.as_ref().and_then(|coroutine| {
+            coroutine
+                .coroutine_drop_async
+                .as_ref()
+                .or(coroutine.coroutine_drop_proxy_async.as_ref())
+        })
     }
 
     #[inline]
@@ -1308,6 +1336,7 @@ impl BasicBlock {
 ///
 /// See [`BasicBlock`] for documentation on what basic blocks are at a high level.
 #[derive(Clone, Debug, TyEncodable, TyDecodable, HashStable, TypeFoldable, TypeVisitable)]
+#[non_exhaustive]
 pub struct BasicBlockData<'tcx> {
     /// List of statements in this block.
     pub statements: Vec<Statement<'tcx>>,
@@ -1331,7 +1360,15 @@ pub struct BasicBlockData<'tcx> {
 
 impl<'tcx> BasicBlockData<'tcx> {
     pub fn new(terminator: Option<Terminator<'tcx>>, is_cleanup: bool) -> BasicBlockData<'tcx> {
-        BasicBlockData { statements: vec![], terminator, is_cleanup }
+        BasicBlockData::new_stmts(Vec::new(), terminator, is_cleanup)
+    }
+
+    pub fn new_stmts(
+        statements: Vec<Statement<'tcx>>,
+        terminator: Option<Terminator<'tcx>>,
+        is_cleanup: bool,
+    ) -> BasicBlockData<'tcx> {
+        BasicBlockData { statements, terminator, is_cleanup }
     }
 
     /// Accessor for terminator.

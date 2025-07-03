@@ -91,7 +91,7 @@ mod as_keyword {}
 ///
 /// When associated with `loop`, a break expression may be used to return a value from that loop.
 /// This is only valid with `loop` and not with any other type of loop.
-/// If no value is specified, `break;` returns `()`.
+/// If no value is specified for `break;` it returns `()`.
 /// Every `break` within a loop must return the same type.
 ///
 /// ```rust
@@ -107,6 +107,33 @@ mod as_keyword {}
 /// // first number in Fibonacci sequence over 10:
 /// assert_eq!(result, 13);
 /// println!("{result}");
+/// ```
+///
+/// It is also possible to exit from any *labelled* block returning the value early.
+/// If no value is specified for `break;` it returns `()`.
+///
+/// ```rust
+/// let inputs = vec!["Cow", "Cat", "Dog", "Snake", "Cod"];
+///
+/// let mut results = vec![];
+/// for input in inputs {
+///     let result = 'filter: {
+///         if input.len() > 3 {
+///             break 'filter Err("Too long");
+///         };
+///
+///         if !input.contains("C") {
+///             break 'filter Err("No Cs");
+///         };
+///
+///         Ok(input.to_uppercase())
+///     };
+///
+///     results.push(result);
+/// }
+///
+/// // [Ok("COW"), Ok("CAT"), Err("No Cs"), Err("Too long"), Ok("COD")]
+/// println!("{:?}", results)
 /// ```
 ///
 /// For more details consult the [Reference on "break expression"] and the [Reference on "break and
@@ -1206,6 +1233,28 @@ mod ref_keyword {}
 ///     Ok(())
 /// }
 /// ```
+///
+/// Within [closures] and [`async`] blocks, `return` returns a value from within the closure or
+/// `async` block, not from the parent function:
+///
+/// ```rust
+/// fn foo() -> i32 {
+///     let closure = || {
+///         return 5;
+///     };
+///
+///     let future = async {
+///         return 10;
+///     };
+///
+///     return 15;
+/// }
+///
+/// assert_eq!(foo(), 15);
+/// ```
+///
+/// [closures]: ../book/ch13-01-closures.html
+/// [`async`]: ../std/keyword.async.html
 mod return_keyword {}
 
 #[doc(keyword = "self")]
@@ -1867,10 +1916,6 @@ mod type_keyword {}
 /// - and to declare that a programmer has checked that these contracts have been upheld (`unsafe
 /// {}` and `unsafe impl`, but also `unsafe fn` -- see below).
 ///
-/// They are not mutually exclusive, as can be seen in `unsafe fn`: the body of an `unsafe fn` is,
-/// by default, treated like an unsafe block. The `unsafe_op_in_unsafe_fn` lint can be enabled to
-/// change that.
-///
 /// # Unsafe abilities
 ///
 /// **No matter what, Safe Rust can't cause Undefined Behavior**. This is
@@ -1911,13 +1956,6 @@ mod type_keyword {}
 /// block has been checked by the programmer and is guaranteed to be respected.
 /// - `unsafe impl`: the contract necessary to implement the trait has been
 /// checked by the programmer and is guaranteed to be respected.
-///
-/// By default, `unsafe fn` also acts like an `unsafe {}` block
-/// around the code inside the function. This means it is not just a signal to
-/// the caller, but also promises that the preconditions for the operations
-/// inside the function are upheld. Mixing these two meanings can be confusing, so the
-/// `unsafe_op_in_unsafe_fn` lint can be enabled to warn against that and require explicit unsafe
-/// blocks even inside `unsafe fn`.
 ///
 /// See the [Rustonomicon] and the [Reference] for more information.
 ///
@@ -2060,6 +2098,7 @@ mod type_keyword {}
 /// impl Indexable for i32 {
 ///     const LEN: usize = 1;
 ///
+///     /// See `Indexable` for the safety contract.
 ///     unsafe fn idx_unchecked(&self, idx: usize) -> i32 {
 ///         debug_assert_eq!(idx, 0);
 ///         *self
@@ -2071,6 +2110,7 @@ mod type_keyword {}
 /// impl Indexable for [i32; 42] {
 ///     const LEN: usize = 42;
 ///
+///     /// See `Indexable` for the safety contract.
 ///     unsafe fn idx_unchecked(&self, idx: usize) -> i32 {
 ///         // SAFETY: As per this trait's documentation, the caller ensures
 ///         // that `idx < 42`.
@@ -2083,6 +2123,7 @@ mod type_keyword {}
 /// impl Indexable for ! {
 ///     const LEN: usize = 0;
 ///
+///     /// See `Indexable` for the safety contract.
 ///     unsafe fn idx_unchecked(&self, idx: usize) -> i32 {
 ///         // SAFETY: As per this trait's documentation, the caller ensures
 ///         // that `idx < 0`, which is impossible, so this is dead code.
@@ -2104,11 +2145,14 @@ mod type_keyword {}
 /// contract of `idx_unchecked`. Implementing `Indexable` is safe because when writing
 /// `idx_unchecked`, we don't have to worry: our *callers* need to discharge a proof obligation
 /// (like `use_indexable` does), but the *implementation* of `get_unchecked` has no proof obligation
-/// to contend with. Of course, the implementation of `Indexable` may choose to call other unsafe
-/// operations, and then it needs an `unsafe` *block* to indicate it discharged the proof
-/// obligations of its callees. (We enabled `unsafe_op_in_unsafe_fn`, so the body of `idx_unchecked`
-/// is not implicitly an unsafe block.) For that purpose it can make use of the contract that all
-/// its callers must uphold -- the fact that `idx < LEN`.
+/// to contend with. Of course, the implementation may choose to call other unsafe operations, and
+/// then it needs an `unsafe` *block* to indicate it discharged the proof obligations of its
+/// callees. For that purpose it can make use of the contract that all its callers must uphold --
+/// the fact that `idx < LEN`.
+///
+/// Note that unlike normal `unsafe fn`, an `unsafe fn` in a trait implementation does not get to
+/// just pick an arbitrary safety contract! It *has* to use the safety contract defined by the trait
+/// (or one with weaker preconditions).
 ///
 /// Formally speaking, an `unsafe fn` in a trait is a function with *preconditions* that go beyond
 /// those encoded by the argument types (such as `idx < LEN`), whereas an `unsafe trait` can declare
@@ -2399,6 +2443,39 @@ mod while_keyword {}
 ///
 /// We have written an [async book] detailing `async`/`await` and trade-offs compared to using threads.
 ///
+/// ## Control Flow
+/// [`return`] statements and [`?`][try operator] operators within `async` blocks do not cause
+/// a return from the parent function; rather, they cause the `Future` returned by the block to
+/// return with that value.
+///
+/// For example, the following Rust function will return `5`, causing `x` to take the [`!` type][never type]:
+/// ```rust
+/// #[expect(unused_variables)]
+/// fn example() -> i32 {
+///     let x = {
+///         return 5;
+///     };
+/// }
+/// ```
+/// In contrast, the following asynchronous function assigns a `Future<Output = i32>` to `x`, and
+/// only returns `5` when `x` is `.await`ed:
+/// ```rust
+/// async fn example() -> i32 {
+///     let x = async {
+///         return 5;
+///     };
+///
+///     x.await
+/// }
+/// ```
+/// Code using `?` behaves similarly - it causes the `async` block to return a [`Result`] without
+/// affecting the parent function.
+///
+/// Note that you cannot use `break` or `continue` from within an `async` block to affect the
+/// control flow of a loop in the parent function.
+///
+/// Control flow in `async` blocks is documented further in the [async book][async book blocks].
+///
 /// ## Editions
 ///
 /// `async` is a keyword from the 2018 edition onwards.
@@ -2408,6 +2485,11 @@ mod while_keyword {}
 /// [`Future`]: future::Future
 /// [`.await`]: ../std/keyword.await.html
 /// [async book]: https://rust-lang.github.io/async-book/
+/// [`return`]: ../std/keyword.return.html
+/// [try operator]: ../reference/expressions/operator-expr.html#r-expr.try
+/// [never type]: ../reference/types/never.html
+/// [`Result`]: result::Result
+/// [async book blocks]: https://rust-lang.github.io/async-book/part-guide/more-async-await.html#async-blocks
 mod async_keyword {}
 
 #[doc(keyword = "await")]

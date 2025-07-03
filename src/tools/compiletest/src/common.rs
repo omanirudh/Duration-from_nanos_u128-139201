@@ -11,6 +11,7 @@ use serde::de::{Deserialize, Deserializer, Error as _};
 
 pub use self::Mode::*;
 use crate::executor::{ColorConfig, OutputFormat};
+use crate::fatal;
 use crate::util::{Utf8PathBufExt, add_dylib_path};
 
 macro_rules! string_enum {
@@ -413,11 +414,6 @@ pub struct Config {
     /// cross-compilation scenarios that do not otherwise want/need to `-Zbuild-std`. Used in e.g.
     /// ABI tests.
     pub minicore_path: Utf8PathBuf,
-
-    /// If true, run tests with the "new" executor that was written to replace
-    /// compiletest's dependency on libtest. Eventually this will become the
-    /// default, and the libtest dependency will be removed.
-    pub new_executor: bool,
 }
 
 impl Config {
@@ -500,6 +496,7 @@ impl Config {
             "arm64ec",
             "riscv32",
             "riscv64",
+            "loongarch32",
             "loongarch64",
             "s390x",
             // These targets require an additional asm_experimental_arch feature.
@@ -787,11 +784,13 @@ fn rustc_output(config: &Config, args: &[&str], envs: HashMap<String, String>) -
 
     let output = match command.output() {
         Ok(output) => output,
-        Err(e) => panic!("error: failed to run {command:?}: {e}"),
+        Err(e) => {
+            fatal!("failed to run {command:?}: {e}");
+        }
     };
     if !output.status.success() {
-        panic!(
-            "error: failed to run {command:?}\n--- stdout\n{}\n--- stderr\n{}",
+        fatal!(
+            "failed to run {command:?}\n--- stdout\n{}\n--- stderr\n{}",
             String::from_utf8(output.stdout).unwrap(),
             String::from_utf8(output.stderr).unwrap(),
         );

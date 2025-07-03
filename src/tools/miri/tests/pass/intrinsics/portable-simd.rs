@@ -331,6 +331,19 @@ fn simd_mask() {
         );
         assert_eq!(selected1, i32x4::from_array([0, 0, 0, 1]));
         assert_eq!(selected2, selected1);
+        // Non-zero "padding" (the extra bits) is also allowed.
+        let selected1 = simd_select_bitmask::<u8, _>(
+            if cfg!(target_endian = "little") { 0b11111000 } else { 0b11110001 },
+            i32x4::splat(1), // yes
+            i32x4::splat(0), // no
+        );
+        let selected2 = simd_select_bitmask::<[u8; 1], _>(
+            if cfg!(target_endian = "little") { [0b11111000] } else { [0b11110001] },
+            i32x4::splat(1), // yes
+            i32x4::splat(0), // no
+        );
+        assert_eq!(selected1, i32x4::from_array([0, 0, 0, 1]));
+        assert_eq!(selected2, selected1);
     }
 
     // Non-power-of-2 multi-byte mask.
@@ -557,6 +570,10 @@ fn simd_round() {
         f32x4::from_array([1.0, 1.0, 2.0, -5.0])
     );
     assert_eq!(
+        unsafe { intrinsics::simd_round_ties_even(f32x4::from_array([0.9, 1.001, 2.0, -4.5])) },
+        f32x4::from_array([1.0, 1.0, 2.0, -4.0])
+    );
+    assert_eq!(
         f32x4::from_array([0.9, 1.001, 2.0, -4.5]).trunc(),
         f32x4::from_array([0.0, 1.0, 2.0, -4.0])
     );
@@ -572,6 +589,10 @@ fn simd_round() {
     assert_eq!(
         f64x4::from_array([0.9, 1.001, 2.0, -4.5]).round(),
         f64x4::from_array([1.0, 1.0, 2.0, -5.0])
+    );
+    assert_eq!(
+        unsafe { intrinsics::simd_round_ties_even(f64x4::from_array([0.9, 1.001, 2.0, -4.5])) },
+        f64x4::from_array([1.0, 1.0, 2.0, -4.0])
     );
     assert_eq!(
         f64x4::from_array([0.9, 1.001, 2.0, -4.5]).trunc(),

@@ -4,15 +4,14 @@ use itertools::Itertools;
 use rustc_data_structures::fx::FxIndexSet;
 use rustc_errors::codes::*;
 use rustc_errors::{Applicability, Diag, ErrorGuaranteed, MultiSpan, a_or_an, listify, pluralize};
-use rustc_hir::def::{CtorOf, DefKind, Res};
+use rustc_hir::def::{CtorKind, CtorOf, DefKind, Res};
 use rustc_hir::def_id::DefId;
 use rustc_hir::intravisit::Visitor;
-use rustc_hir::{ExprKind, HirId, Node, QPath};
-use rustc_hir_analysis::check::intrinsicck::InlineAsmCtxt;
+use rustc_hir::{ExprKind, HirId, LangItem, Node, QPath};
 use rustc_hir_analysis::check::potentially_plural_count;
-use rustc_hir_analysis::hir_ty_lowering::HirTyLowerer;
+use rustc_hir_analysis::hir_ty_lowering::{HirTyLowerer, PermitVariants};
 use rustc_index::IndexVec;
-use rustc_infer::infer::{DefineOpaqueTypes, InferOk, TypeTrace};
+use rustc_infer::infer::{BoundRegionConversionTime, DefineOpaqueTypes, InferOk, TypeTrace};
 use rustc_middle::ty::adjustment::AllowTwoPhase;
 use rustc_middle::ty::error::TypeError;
 use rustc_middle::ty::{self, IsSuggestable, Ty, TyCtxt, TypeVisitableExt};
@@ -31,15 +30,14 @@ use crate::TupleArgumentsFlag::*;
 use crate::coercion::CoerceMany;
 use crate::errors::SuggestPtrNullMut;
 use crate::fn_ctxt::arg_matrix::{ArgMatrix, Compatibility, Error, ExpectedIdx, ProvidedIdx};
-use crate::fn_ctxt::infer::FnCall;
 use crate::gather_locals::Declaration;
-use crate::method::MethodCallee;
+use crate::inline_asm::InlineAsmCtxt;
 use crate::method::probe::IsSuggestion;
 use crate::method::probe::Mode::MethodCall;
 use crate::method::probe::ProbeScope::TraitsInScope;
 use crate::{
-    BreakableCtxt, Diverges, Expectation, FnCtxt, LoweredTy, Needs, TupleArgumentsFlag, errors,
-    struct_span_code_err,
+    BreakableCtxt, Diverges, Expectation, FnCtxt, GatherLocalsVisitor, LoweredTy, Needs,
+    TupleArgumentsFlag, errors, struct_span_code_err,
 };
 
 rustc_index::newtype_index! {
@@ -98,94 +96,105 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         debug!("FnCtxt::check_asm: {} deferred checks", deferred_asm_checks.len());
         for (asm, hir_id) in deferred_asm_checks.drain(..) {
             let enclosing_id = self.tcx.hir_enclosing_body_owner(hir_id);
-            InlineAsmCtxt::new(
-                enclosing_id,
-                &self.infcx,
-                self.typing_env(self.param_env),
-                &*self.typeck_results.borrow(),
-            )
-            .check_asm(asm);
+            InlineAsmCtxt::new(self, enclosing_id).check_asm(asm);
         }
     }
 
     pub(in super::super) fn check_repeat_exprs(&self) {
         let mut deferred_repeat_expr_checks = self.deferred_repeat_expr_checks.borrow_mut();
         debug!("FnCtxt::check_repeat_exprs: {} deferred checks", deferred_repeat_expr_checks.len());
-        for (element, element_ty, count) in deferred_repeat_expr_checks.drain(..) {
-            // We want to emit an error if the const is not structurally resolveable as otherwise
-            // we can find up conservatively proving `Copy` which may infer the repeat expr count
-            // to something that never required `Copy` in the first place.
-            let count =
-                self.structurally_resolve_const(element.span, self.normalize(element.span, count));
 
-            // Avoid run on "`NotCopy: Copy` is not implemented" errors when the repeat expr count
-            // is erroneous/unknown. The user might wind up specifying a repeat count of 0/1.
-            if count.references_error() {
-                continue;
-            }
+        let deferred_repeat_expr_checks = deferred_repeat_expr_checks
+            .drain(..)
+            .flat_map(|(element, element_ty, count)| {
+                // Actual constants as the repeat element are inserted repeatedly instead
+                // of being copied via `Copy`, so we don't need to attempt to structurally
+                // resolve the repeat count which may unnecessarily error.
+                match &element.kind {
+                    hir::ExprKind::ConstBlock(..) => return None,
+                    hir::ExprKind::Path(qpath) => {
+                        let res = self.typeck_results.borrow().qpath_res(qpath, element.hir_id);
+                        if let Res::Def(DefKind::Const | DefKind::AssocConst, _) = res {
+                            return None;
+                        }
+                    }
+                    _ => {}
+                }
 
-            // If the length is 0, we don't create any elements, so we don't copy any.
-            // If the length is 1, we don't copy that one element, we move it. Only check
-            // for `Copy` if the length is larger.
-            if count.try_to_target_usize(self.tcx).is_none_or(|x| x > 1) {
-                self.enforce_repeat_element_needs_copy_bound(element, element_ty);
-            }
-        }
-    }
+                // We want to emit an error if the const is not structurally resolvable
+                // as otherwise we can wind up conservatively proving `Copy` which may
+                // infer the repeat expr count to something that never required `Copy` in
+                // the first place.
+                let count = self
+                    .structurally_resolve_const(element.span, self.normalize(element.span, count));
 
-    pub(in super::super) fn check_method_argument_types(
-        &self,
-        sp: Span,
-        expr: &'tcx hir::Expr<'tcx>,
-        method: Result<MethodCallee<'tcx>, ErrorGuaranteed>,
-        args_no_rcvr: &'tcx [hir::Expr<'tcx>],
-        tuple_arguments: TupleArgumentsFlag,
-        expected: Expectation<'tcx>,
-    ) -> Ty<'tcx> {
-        let has_error = match method {
-            Ok(method) => method.args.error_reported().and(method.sig.error_reported()),
-            Err(guar) => Err(guar),
-        };
-        if let Err(guar) = has_error {
-            let err_inputs = self.err_args(
-                method.map_or(args_no_rcvr.len(), |method| method.sig.inputs().len() - 1),
-                guar,
-            );
-            let err_output = Ty::new_error(self.tcx, guar);
+                // Avoid run on "`NotCopy: Copy` is not implemented" errors when the
+                // repeat expr count is erroneous/unknown. The user might wind up
+                // specifying a repeat count of 0/1.
+                if count.references_error() {
+                    return None;
+                }
 
-            let err_inputs = match tuple_arguments {
-                DontTupleArguments => err_inputs,
-                TupleArguments => vec![Ty::new_tup(self.tcx, &err_inputs)],
+                Some((element, element_ty, count))
+            })
+            // We collect to force the side effects of structurally resolving the repeat
+            // count to happen in one go, to avoid side effects from proving `Copy`
+            // affecting whether repeat counts are known or not. If we did not do this we
+            // would get results that depend on the order that we evaluate each repeat
+            // expr's `Copy` check.
+            .collect::<Vec<_>>();
+
+        let enforce_copy_bound = |element: &hir::Expr<'_>, element_ty| {
+            // If someone calls a const fn or constructs a const value, they can extract that
+            // out into a separate constant (or a const block in the future), so we check that
+            // to tell them that in the diagnostic. Does not affect typeck.
+            let is_constable = match element.kind {
+                hir::ExprKind::Call(func, _args) => match *self.node_ty(func.hir_id).kind() {
+                    ty::FnDef(def_id, _) if self.tcx.is_stable_const_fn(def_id) => {
+                        traits::IsConstable::Fn
+                    }
+                    _ => traits::IsConstable::No,
+                },
+                hir::ExprKind::Path(qpath) => {
+                    match self.typeck_results.borrow().qpath_res(&qpath, element.hir_id) {
+                        Res::Def(DefKind::Ctor(_, CtorKind::Const), _) => traits::IsConstable::Ctor,
+                        _ => traits::IsConstable::No,
+                    }
+                }
+                _ => traits::IsConstable::No,
             };
 
-            self.check_argument_types(
-                sp,
-                expr,
-                &err_inputs,
-                err_output,
-                NoExpectation,
-                args_no_rcvr,
-                false,
-                tuple_arguments,
-                method.ok().map(|method| method.def_id),
-            );
-            return err_output;
+            let lang_item = self.tcx.require_lang_item(LangItem::Copy, element.span);
+            let code = traits::ObligationCauseCode::RepeatElementCopy {
+                is_constable,
+                elt_span: element.span,
+            };
+            self.require_type_meets(element_ty, element.span, code, lang_item);
+        };
+
+        for (element, element_ty, count) in deferred_repeat_expr_checks {
+            match count.kind() {
+                ty::ConstKind::Value(val) => {
+                    if val.try_to_target_usize(self.tcx).is_none_or(|count| count > 1) {
+                        enforce_copy_bound(element, element_ty)
+                    } else {
+                        // If the length is 0 or 1 we don't actually copy the element, we either don't create it
+                        // or we just use the one value.
+                    }
+                }
+
+                // If the length is a generic parameter or some rigid alias then conservatively
+                // require `element_ty: Copy` as it may wind up being `>1` after monomorphization.
+                ty::ConstKind::Param(_)
+                | ty::ConstKind::Expr(_)
+                | ty::ConstKind::Placeholder(_)
+                | ty::ConstKind::Unevaluated(_) => enforce_copy_bound(element, element_ty),
+
+                ty::ConstKind::Bound(_, _) | ty::ConstKind::Infer(_) | ty::ConstKind::Error(_) => {
+                    unreachable!()
+                }
+            }
         }
-
-        let method = method.unwrap();
-        self.check_argument_types(
-            sp,
-            expr,
-            &method.sig.inputs()[1..],
-            method.sig.output(),
-            expected,
-            args_no_rcvr,
-            method.sig.c_variadic,
-            tuple_arguments,
-            Some(method.def_id),
-        );
-
-        method.sig.output()
     }
 
     /// Generic function that factors out common logic from function calls,
@@ -647,7 +656,11 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 let args = self.infcx.fresh_args_for_item(call_name.span, assoc.def_id);
                 let fn_sig = tcx.fn_sig(assoc.def_id).instantiate(tcx, args);
 
-                self.instantiate_binder_with_fresh_vars(call_name.span, FnCall, fn_sig);
+                self.instantiate_binder_with_fresh_vars(
+                    call_name.span,
+                    BoundRegionConversionTime::FnCall,
+                    fn_sig,
+                );
             }
             None
         };
@@ -1546,25 +1559,20 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             SuggestionText::Reorder => Some("reorder these arguments".to_string()),
             SuggestionText::DidYouMean => Some("did you mean".to_string()),
         };
-        if let Some(suggestion_text) = suggestion_text {
+        if let Some(suggestion_text) = suggestion_text
+            && !full_call_span.in_external_macro(self.sess().source_map())
+        {
             let source_map = self.sess().source_map();
-            let (mut suggestion, suggestion_span) = if let Some(call_span) =
-                full_call_span.find_ancestor_inside_same_ctxt(error_span)
-            {
-                ("(".to_string(), call_span.shrink_to_hi().to(error_span.shrink_to_hi()))
+            let suggestion_span = if let Some(args_span) = error_span.trim_start(full_call_span) {
+                // Span of the braces, e.g. `(a, b, c)`.
+                args_span
             } else {
-                (
-                    format!(
-                        "{}(",
-                        source_map.span_to_snippet(full_call_span).unwrap_or_else(|_| {
-                            fn_def_id.map_or("".to_string(), |fn_def_id| {
-                                tcx.item_name(fn_def_id).to_string()
-                            })
-                        })
-                    ),
-                    error_span,
-                )
+                // The arg span of a function call that wasn't even given braces
+                // like what might happen with delegation reuse.
+                // e.g. `reuse HasSelf::method;` should suggest `reuse HasSelf::method($args);`.
+                full_call_span.shrink_to_hi()
             };
+            let mut suggestion = "(".to_owned();
             let mut needs_comma = false;
             for (expected_idx, provided_idx) in matched_inputs.iter_enumerated() {
                 if needs_comma {
@@ -1629,7 +1637,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ast::LitKind::ByteStr(ref v, _) => Ty::new_imm_ref(
                 tcx,
                 tcx.lifetimes.re_static,
-                Ty::new_array(tcx, tcx.types.u8, v.len() as u64),
+                Ty::new_array(tcx, tcx.types.u8, v.as_byte_str().len() as u64),
             ),
             ast::LitKind::Byte(_) => tcx.types.u8,
             ast::LitKind::Char(_) => tcx.types.char,
@@ -1675,8 +1683,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             ast::LitKind::CStr(_, _) => Ty::new_imm_ref(
                 tcx,
                 tcx.lifetimes.re_static,
-                tcx.type_of(tcx.require_lang_item(hir::LangItem::CStr, Some(lit.span)))
-                    .skip_binder(),
+                tcx.type_of(tcx.require_lang_item(hir::LangItem::CStr, lit.span)).skip_binder(),
             ),
             ast::LitKind::Err(guar) => Ty::new_error(tcx, guar),
         }
@@ -1827,6 +1834,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
 
     /// Type check a `let` statement.
     fn check_decl_local(&self, local: &'tcx hir::LetStmt<'tcx>) {
+        GatherLocalsVisitor::gather_from_local(self, local);
+
         let ty = self.check_decl(local.into());
         self.write_ty(local.hir_id, ty);
         if local.pat.is_never_pattern() {
@@ -2165,15 +2174,25 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         match *qpath {
             QPath::Resolved(ref maybe_qself, path) => {
                 let self_ty = maybe_qself.as_ref().map(|qself| self.lower_ty(qself).raw);
-                let ty = self.lowerer().lower_path(self_ty, path, hir_id, true);
+                let ty = self.lowerer().lower_resolved_ty_path(
+                    self_ty,
+                    path,
+                    hir_id,
+                    PermitVariants::Yes,
+                );
                 (path.res, LoweredTy::from_raw(self, path_span, ty))
             }
-            QPath::TypeRelative(qself, segment) => {
-                let ty = self.lower_ty(qself);
+            QPath::TypeRelative(hir_self_ty, segment) => {
+                let self_ty = self.lower_ty(hir_self_ty);
 
-                let result = self
-                    .lowerer()
-                    .lower_assoc_path_ty(hir_id, path_span, ty.raw, qself, segment, true);
+                let result = self.lowerer().lower_type_relative_ty_path(
+                    self_ty.raw,
+                    hir_self_ty,
+                    segment,
+                    hir_id,
+                    path_span,
+                    PermitVariants::Yes,
+                );
                 let ty = result
                     .map(|(ty, _, _)| ty)
                     .unwrap_or_else(|guar| Ty::new_error(self.tcx(), guar));
@@ -2399,7 +2418,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 }
 
                 if !mismatched_params.is_empty() {
-                    // For each mismatched paramter, create a two-way link to each matched parameter
+                    // For each mismatched parameter, create a two-way link to each matched parameter
                     // of the same type.
                     let mut dependants = IndexVec::<ExpectedIdx, _>::from_fn_n(
                         |_| SmallVec::<[u32; 4]>::new(),
@@ -2442,7 +2461,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             spans.push_span_label(param.param.span(), "");
                         }
                     }
-                    // Highligh each parameter being depended on for a generic type.
+                    // Highlight each parameter being depended on for a generic type.
                     for ((&(_, param), deps), &(_, expected_ty)) in
                         params_with_generics.iter().zip(&dependants).zip(formal_and_expected_inputs)
                     {

@@ -4,9 +4,7 @@
 
 // tidy-alphabetical-start
 #![allow(internal_features)]
-#![cfg_attr(bootstrap, feature(let_chains))]
 #![feature(associated_type_defaults)]
-#![feature(box_patterns)]
 #![feature(closure_track_caller)]
 #![feature(debug_closure_helpers)]
 #![feature(exhaustive_patterns)]
@@ -14,6 +12,7 @@
 #![feature(never_type)]
 #![feature(rustc_attrs)]
 #![feature(variant_count)]
+#![recursion_limit = "256"]
 // tidy-alphabetical-end
 
 extern crate self as rustc_hir;
@@ -28,6 +27,7 @@ mod hir;
 pub mod hir_id;
 pub mod intravisit;
 pub mod lang_items;
+pub mod lints;
 pub mod pat_util;
 mod stable_hash_impls;
 mod target;

@@ -163,7 +163,7 @@ fn check_version(config: &Config) -> Option<String> {
             msg.push_str("WARNING: The `change-id` is missing in the `bootstrap.toml`. This means that you will not be able to track the major changes made to the bootstrap configurations.\n");
             msg.push_str("NOTE: to silence this warning, ");
             msg.push_str(&format!(
-                "add `change-id = {latest_change_id}` or change-id = \"ignore\" at the top of `bootstrap.toml`"
+                "add `change-id = {latest_change_id}` or `change-id = \"ignore\"` at the top of `bootstrap.toml`"
             ));
             return Some(msg);
         }
@@ -195,7 +195,7 @@ fn check_version(config: &Config) -> Option<String> {
 
     msg.push_str("NOTE: to silence this warning, ");
     msg.push_str(&format!(
-        "update `bootstrap.toml` to use `change-id = {latest_change_id}` or change-id = \"ignore\" instead"
+        "update `bootstrap.toml` to use `change-id = {latest_change_id}` or `change-id = \"ignore\"` instead"
     ));
 
     if io::stdout().is_terminal() {
@@ -217,12 +217,11 @@ fn check_version(config: &Config) -> Option<String> {
 //   "tracing", instrument(..))]`.
 #[cfg(feature = "tracing")]
 fn setup_tracing() -> impl Drop {
+    use tracing_forest::ForestLayer;
     use tracing_subscriber::EnvFilter;
     use tracing_subscriber::layer::SubscriberExt;
 
     let filter = EnvFilter::from_env("BOOTSTRAP_TRACING");
-    // cf. <https://docs.rs/tracing-tree/latest/tracing_tree/struct.HierarchicalLayer.html>.
-    let layer = tracing_tree::HierarchicalLayer::default().with_targets(true).with_indent_amount(2);
 
     let mut chrome_layer = tracing_chrome::ChromeLayerBuilder::new().include_args(true);
 
@@ -233,7 +232,8 @@ fn setup_tracing() -> impl Drop {
 
     let (chrome_layer, _guard) = chrome_layer.build();
 
-    let registry = tracing_subscriber::registry().with(filter).with(layer).with(chrome_layer);
+    let registry =
+        tracing_subscriber::registry().with(filter).with(ForestLayer::default()).with(chrome_layer);
 
     tracing::subscriber::set_global_default(registry).unwrap();
     _guard

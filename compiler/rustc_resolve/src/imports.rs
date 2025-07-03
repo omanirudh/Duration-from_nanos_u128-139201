@@ -30,8 +30,7 @@ use crate::diagnostics::{DiagMode, Suggestion, import_candidates};
 use crate::errors::{
     CannotBeReexportedCratePublic, CannotBeReexportedCratePublicNS, CannotBeReexportedPrivate,
     CannotBeReexportedPrivateNS, CannotDetermineImportResolution, CannotGlobImportAllCrates,
-    ConsiderAddingMacroExport, ConsiderMarkingAsPub, IsNotDirectlyImportable,
-    ItemsInTraitsAreNotImportable,
+    ConsiderAddingMacroExport, ConsiderMarkingAsPub,
 };
 use crate::{
     AmbiguityError, AmbiguityKind, BindingKey, Finalize, ImportSuggestion, Module,
@@ -134,7 +133,9 @@ impl<'ra> std::fmt::Debug for ImportKind<'ra> {
                 .field("target", target)
                 .field("id", id)
                 .finish(),
-            MacroUse { .. } => f.debug_struct("MacroUse").finish(),
+            MacroUse { warn_private } => {
+                f.debug_struct("MacroUse").field("warn_private", warn_private).finish()
+            }
             MacroExport => f.debug_struct("MacroExport").finish(),
         }
     }
@@ -173,7 +174,14 @@ pub(crate) struct ImportData<'ra> {
 
     pub parent_scope: ParentScope<'ra>,
     pub module_path: Vec<Segment>,
-    /// The resolution of `module_path`.
+    /// The resolution of `module_path`:
+    ///
+    /// | `module_path` | `imported_module` | remark |
+    /// |-|-|-|
+    /// |`use prefix::foo`| `ModuleOrUniformRoot::Module(prefix)`               | - |
+    /// |`use ::foo`      | `ModuleOrUniformRoot::ExternPrelude`                | 2018+ editions |
+    /// |`use ::foo`      | `ModuleOrUniformRoot::CrateRootAndExternPrelude`    | a special case in 2015 edition |
+    /// |`use foo`        | `ModuleOrUniformRoot::CurrentScope`                 | - |
     pub imported_module: Cell<Option<ModuleOrUniformRoot<'ra>>>,
     pub vis: ty::Visibility,
 }
@@ -607,7 +615,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             }
         }
 
-        self.throw_unresolved_import_error(errors, glob_error);
+        if !errors.is_empty() {
+            self.throw_unresolved_import_error(errors, glob_error);
+        }
     }
 
     pub(crate) fn check_hidden_glob_reexports(
@@ -687,14 +697,19 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             Some(def_id) if self.mods_with_parse_errors.contains(&def_id) => false,
             _ => true,
         });
+        errors.retain(|(_import, err)| {
+            // If we've encountered something like `use _;`, we've already emitted an error stating
+            // that `_` is not a valid identifier, so we ignore that resolve error.
+            err.segment != Some(kw::Underscore)
+        });
+
         if errors.is_empty() {
+            self.tcx.dcx().delayed_bug("expected a parse or \"`_` can't be an identifier\" error");
             return;
         }
 
-        /// Upper limit on the number of `span_label` messages.
-        const MAX_LABEL_COUNT: usize = 10;
-
         let span = MultiSpan::from_spans(errors.iter().map(|(_, err)| err.span).collect());
+
         let paths = errors
             .iter()
             .map(|(import, err)| {
@@ -713,6 +728,9 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
         if let Some((_, UnresolvedImportError { note: Some(note), .. })) = errors.iter().last() {
             diag.note(note.clone());
         }
+
+        /// Upper limit on the number of `span_label` messages.
+        const MAX_LABEL_COUNT: usize = 10;
 
         for (import, err) in errors.into_iter().take(MAX_LABEL_COUNT) {
             if let Some(label) = err.label {
@@ -835,11 +853,8 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
 
                 let parent = import.parent_scope.module;
                 match source_bindings[ns].get() {
-                    Err(Undetermined) => indeterminate_count += 1,
-                    // Don't update the resolution, because it was never added.
-                    Err(Determined) if target.name == kw::Underscore => {}
-                    Ok(binding) if binding.is_importable() => {
-                        if binding.is_assoc_const_or_fn()
+                    Ok(binding) => {
+                        if binding.is_assoc_item()
                             && !this.tcx.features().import_trait_associated_functions()
                         {
                             feature_err(
@@ -850,21 +865,21 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
                             )
                             .emit();
                         }
+
                         let imported_binding = this.import(binding, import);
                         target_bindings[ns].set(Some(imported_binding));
                         this.define(parent, target, ns, imported_binding);
                     }
-                    source_binding @ (Ok(..) | Err(Determined)) => {
-                        if source_binding.is_ok() {
-                            this.dcx()
-                                .create_err(IsNotDirectlyImportable { span: import.span, target })
-                                .emit();
+                    Err(Determined) => {
+                        // Don't update the resolution for underscores, because it was never added.
+                        if target.name != kw::Underscore {
+                            let key = BindingKey::new(target, ns);
+                            this.update_resolution(parent, key, false, |_, resolution| {
+                                resolution.single_imports.swap_remove(&import);
+                            });
                         }
-                        let key = BindingKey::new(target, ns);
-                        this.update_resolution(parent, key, false, |_, resolution| {
-                            resolution.single_imports.swap_remove(&import);
-                        });
                     }
+                    Err(Undetermined) => indeterminate_count += 1,
                 }
             }
         });
@@ -1428,10 +1443,17 @@ impl<'ra, 'tcx> Resolver<'ra, 'tcx> {
             return;
         };
 
-        if module.is_trait() {
-            self.dcx().emit_err(ItemsInTraitsAreNotImportable { span: import.span });
-            return;
-        } else if module == import.parent_scope.module {
+        if module.is_trait() && !self.tcx.features().import_trait_associated_functions() {
+            feature_err(
+                self.tcx.sess,
+                sym::import_trait_associated_functions,
+                import.span,
+                "`use` associated items of traits is unstable",
+            )
+            .emit();
+        }
+
+        if module == import.parent_scope.module {
             return;
         } else if is_prelude {
             self.prelude = Some(module);

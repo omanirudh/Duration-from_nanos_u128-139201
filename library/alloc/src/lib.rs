@@ -66,7 +66,6 @@
 )]
 #![doc(cfg_hide(
     not(test),
-    not(any(test, bootstrap)),
     no_global_oom_handling,
     not(no_global_oom_handling),
     not(no_rc),
@@ -122,6 +121,7 @@
 #![feature(fmt_internals)]
 #![feature(fn_traits)]
 #![feature(formatting_options)]
+#![feature(generic_atomic)]
 #![feature(hasher_prefixfree_extras)]
 #![feature(inplace_iteration)]
 #![feature(iter_advance_by)]
@@ -131,7 +131,6 @@
 #![feature(local_waker)]
 #![feature(maybe_uninit_slice)]
 #![feature(maybe_uninit_uninit_array_transpose)]
-#![feature(nonnull_provenance)]
 #![feature(panic_internals)]
 #![feature(pattern)]
 #![feature(pin_coerce_unsized_trait)]

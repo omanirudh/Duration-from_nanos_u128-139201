@@ -77,7 +77,7 @@ This repository is linked to `rust-lang/rust` as a [josh](https://josh-project.g
 You'll need to install `josh-proxy` locally via
 
 ```
-cargo +stable install josh-proxy --git https://github.com/josh-project/josh --tag r24.10.04
+cargo install josh-proxy --git https://github.com/josh-project/josh --tag r24.10.04
 ```
 Older versions of `josh-proxy` may not round trip commits losslessly so it is important to install this exact version.
 
@@ -91,6 +91,16 @@ Older versions of `josh-proxy` may not round trip commits losslessly so it is im
 3) Push the branch to your fork and create a PR into `rustc-dev-guide`
 
 ### Push changes from this repository into `rust-lang/rust`
+
+NOTE: If you use Git protocol to push to your fork of `rust-lang/rust`,
+ensure that you have this entry in your Git config,
+else the 2 steps that follow would prompt for a username and password:
+
+```
+[url "git@github.com:"]
+insteadOf = "https://github.com/"
+```
+
 1) Run the push command to create a branch named `<branch-name>` in a `rustc` fork under the `<gh-username>` account
     ```
     cargo run --manifest-path josh-sync/Cargo.toml rustc-push <branch-name> <gh-username>
@@ -106,5 +116,5 @@ You may observe "Nothing to pull" even if you *know* rustc-pull has something to
 To minimize the likelihood of this happening, you may wish to keep a separate *minimal* git config that *only* has `[user]` entries from global git config, then repoint system git to use the minimal git config instead. E.g.
 
 ```
-GIT_CONFIG_GLOBAL=/path/to/minimal/gitconfig GIT_CONFIG_SYSTEM='' cargo +stable run --manifest-path josh-sync/Cargo.toml -- rustc-pull
+GIT_CONFIG_GLOBAL=/path/to/minimal/gitconfig GIT_CONFIG_SYSTEM='' cargo run --manifest-path josh-sync/Cargo.toml -- rustc-pull
 ```

@@ -622,35 +622,8 @@ extern "C" LLVMValueRef LLVMRustBuildAtomicStore(LLVMBuilderRef B,
   return wrap(SI);
 }
 
-enum class LLVMRustAsmDialect {
-  Att,
-  Intel,
-};
-
-static InlineAsm::AsmDialect fromRust(LLVMRustAsmDialect Dialect) {
-  switch (Dialect) {
-  case LLVMRustAsmDialect::Att:
-    return InlineAsm::AD_ATT;
-  case LLVMRustAsmDialect::Intel:
-    return InlineAsm::AD_Intel;
-  default:
-    report_fatal_error("bad AsmDialect.");
-  }
-}
-
 extern "C" uint64_t LLVMRustGetArrayNumElements(LLVMTypeRef Ty) {
   return unwrap(Ty)->getArrayNumElements();
-}
-
-extern "C" LLVMValueRef
-LLVMRustInlineAsm(LLVMTypeRef Ty, char *AsmString, size_t AsmStringLen,
-                  char *Constraints, size_t ConstraintsLen,
-                  LLVMBool HasSideEffects, LLVMBool IsAlignStack,
-                  LLVMRustAsmDialect Dialect, LLVMBool CanThrow) {
-  return wrap(InlineAsm::get(
-      unwrap<FunctionType>(Ty), StringRef(AsmString, AsmStringLen),
-      StringRef(Constraints, ConstraintsLen), HasSideEffects, IsAlignStack,
-      fromRust(Dialect), CanThrow));
 }
 
 extern "C" bool LLVMRustInlineAsmVerify(LLVMTypeRef Ty, char *Constraints,
@@ -971,6 +944,27 @@ extern "C" LLVMMetadataRef LLVMRustDIGetInstMetadata(LLVMValueRef x) {
     return wrap(MD);
   }
   return nullptr;
+}
+
+extern "C" void
+LLVMRustRemoveEnumAttributeAtIndex(LLVMValueRef F, size_t index,
+                                   LLVMRustAttributeKind RustAttr) {
+  LLVMRemoveEnumAttributeAtIndex(F, index, fromRust(RustAttr));
+}
+
+extern "C" bool LLVMRustHasFnAttribute(LLVMValueRef F, const char *Name,
+                                       size_t NameLen) {
+  if (auto *Fn = dyn_cast<Function>(unwrap<Value>(F))) {
+    return Fn->hasFnAttribute(StringRef(Name, NameLen));
+  }
+  return false;
+}
+
+extern "C" void LLVMRustRemoveFnAttribute(LLVMValueRef Fn, const char *Name,
+                                          size_t NameLen) {
+  if (auto *F = dyn_cast<Function>(unwrap<Value>(Fn))) {
+    F->removeFnAttr(StringRef(Name, NameLen));
+  }
 }
 
 extern "C" void LLVMRustGlobalAddMetadata(LLVMValueRef Global, unsigned Kind,

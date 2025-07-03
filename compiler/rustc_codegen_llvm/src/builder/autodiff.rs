@@ -114,7 +114,7 @@ fn match_args_from_caller_to_enzyme<'ll>(
             let mul = unsafe {
                 llvm::LLVMBuildMul(
                     builder.llbuilder,
-                    cx.get_const_i64(elem_bytes_size),
+                    cx.get_const_int(cx.type_i64(), elem_bytes_size),
                     next_outer_arg,
                     UNNAMED,
                 )
@@ -361,6 +361,11 @@ fn generate_enzyme_call<'ll>(
         let attr = llvm::AttributeKind::NoInline.create_attr(cx.llcx);
         attributes::apply_to_llfn(ad_fn, Function, &[attr]);
 
+        // We add a made-up attribute just such that we can recognize it after AD to update
+        // (no)-inline attributes. We'll then also remove this attribute.
+        let enzyme_marker_attr = llvm::CreateAttrString(cx.llcx, "enzyme_marker");
+        attributes::apply_to_llfn(outer_fn, Function, &[enzyme_marker_attr]);
+
         // first, remove all calls from fnc
         let entry = llvm::LLVMGetFirstBasicBlock(outer_fn);
         let br = llvm::LLVMRustGetTerminator(entry);
@@ -380,7 +385,7 @@ fn generate_enzyme_call<'ll>(
         if attrs.width > 1 {
             let enzyme_width = cx.create_metadata("enzyme_width".to_string()).unwrap();
             args.push(cx.get_metadata_value(enzyme_width));
-            args.push(cx.get_const_i64(attrs.width as u64));
+            args.push(cx.get_const_int(cx.type_i64(), attrs.width as u64));
         }
 
         let has_sret = has_sret(outer_fn);

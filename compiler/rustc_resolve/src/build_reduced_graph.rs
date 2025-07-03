@@ -549,7 +549,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                         source = module_path.pop().unwrap();
                         if rename.is_none() {
                             // Keep the span of `self`, but the name of `foo`
-                            ident = Ident { name: source.ident.name, span: self_span };
+                            ident = Ident::new(source.ident.name, self_span);
                         }
                     }
                 } else {
@@ -597,7 +597,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                         if let Some(crate_name) = crate_name {
                             // `crate_name` should not be interpreted as relative.
                             module_path.push(Segment::from_ident_and_id(
-                                Ident { name: kw::PathRoot, span: source.ident.span },
+                                Ident::new(kw::PathRoot, source.ident.span),
                                 self.r.next_node_id(),
                             ));
                             source.ident.name = crate_name;
@@ -823,7 +823,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
             }
 
             // These items live in both the type and value namespaces.
-            ItemKind::Struct(ident, ref vdata, _) => {
+            ItemKind::Struct(ident, _, ref vdata) => {
                 self.build_reduced_graph_for_struct_variant(
                     vdata.fields(),
                     ident,
@@ -874,7 +874,7 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
                 }
             }
 
-            ItemKind::Union(ident, ref vdata, _) => {
+            ItemKind::Union(ident, _, ref vdata) => {
                 self.build_reduced_graph_for_struct_variant(
                     vdata.fields(),
                     ident,
@@ -1098,22 +1098,20 @@ impl<'a, 'ra, 'tcx> BuildReducedGraphVisitor<'a, 'ra, 'tcx> {
             self.r.potentially_unused_imports.push(import);
             module.for_each_child(self, |this, ident, ns, binding| {
                 if ns == MacroNS {
-                    let imported_binding =
-                        if this.r.is_accessible_from(binding.vis, this.parent_scope.module) {
-                            this.r.import(binding, import)
-                        } else if !this.r.is_builtin_macro(binding.res())
-                            && !this.r.macro_use_prelude.contains_key(&ident.name)
-                        {
-                            // - `!r.is_builtin_macro(res)` excluding the built-in macros such as `Debug` or `Hash`.
-                            // - `!r.macro_use_prelude.contains_key(name)` excluding macros defined in other extern
-                            //    crates such as `std`.
-                            // FIXME: This branch should eventually be removed.
-                            let import = macro_use_import(this, span, true);
-                            this.r.import(binding, import)
-                        } else {
+                    let import = if this.r.is_accessible_from(binding.vis, this.parent_scope.module)
+                    {
+                        import
+                    } else {
+                        // FIXME: This branch is used for reporting the `private_macro_use` lint
+                        // and should eventually be removed.
+                        if this.r.macro_use_prelude.contains_key(&ident.name) {
+                            // Do not override already existing entries with compatibility entries.
                             return;
-                        };
-                    this.add_macro_use_binding(ident.name, imported_binding, span, allow_shadowing);
+                        }
+                        macro_use_import(this, span, true)
+                    };
+                    let import_binding = this.r.import(binding, import);
+                    this.add_macro_use_binding(ident.name, import_binding, span, allow_shadowing);
                 }
             });
         } else {

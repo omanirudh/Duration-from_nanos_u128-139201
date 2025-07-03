@@ -20,6 +20,9 @@ use crate::{self as ty, DebruijnIndex, Interner};
 mod closure;
 
 /// Specifies how a trait object is represented.
+///
+/// This used to have a variant `DynStar`, but that variant has been removed,
+/// and it's likely this whole enum will be removed soon.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[cfg_attr(
     feature = "nightly",
@@ -28,13 +31,6 @@ mod closure;
 pub enum DynKind {
     /// An unsized `dyn Trait` object
     Dyn,
-    /// A sized `dyn* Trait` object
-    ///
-    /// These objects are represented as a `(data, vtable)` pair where `data` is a value of some
-    /// ptr-sized and ptr-aligned dynamically determined type `T` and `vtable` is a pointer to the
-    /// vtable of `impl T for Trait`. This allows a `dyn*` object to be treated agnostically with
-    /// respect to whether it points to a `Box<T>`, `Rc<T>`, etc.
-    DynStar,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -54,7 +50,7 @@ pub enum AliasTyKind {
     /// A type alias that actually checks its trait bounds.
     /// Currently only used if the type alias references opaque types.
     /// Can always be normalized away.
-    Weak,
+    Free,
 }
 
 impl AliasTyKind {
@@ -63,7 +59,7 @@ impl AliasTyKind {
             AliasTyKind::Projection => "associated type",
             AliasTyKind::Inherent => "inherent associated type",
             AliasTyKind::Opaque => "opaque type",
-            AliasTyKind::Weak => "type alias",
+            AliasTyKind::Free => "type alias",
         }
     }
 }
@@ -223,7 +219,7 @@ pub enum TyKind<I: Interner> {
     /// A tuple type. For example, `(i32, bool)`.
     Tuple(I::Tys),
 
-    /// A projection, opaque type, weak type alias, or inherent associated type.
+    /// A projection, opaque type, free type alias, or inherent associated type.
     /// All of these types are represented as pairs of def-id and args, and can
     /// be normalized, so they are grouped conceptually.
     Alias(AliasTyKind, AliasTy<I>),
@@ -371,7 +367,6 @@ impl<I: Interner> fmt::Debug for TyKind<I> {
             UnsafeBinder(binder) => write!(f, "{:?}", binder),
             Dynamic(p, r, repr) => match repr {
                 DynKind::Dyn => write!(f, "dyn {p:?} + {r:?}"),
-                DynKind::DynStar => write!(f, "dyn* {p:?} + {r:?}"),
             },
             Closure(d, s) => f.debug_tuple("Closure").field(d).field(&s).finish(),
             CoroutineClosure(d, s) => f.debug_tuple("CoroutineClosure").field(d).field(&s).finish(),
@@ -511,28 +506,6 @@ impl<I: Interner> AliasTy<I> {
     /// as well.
     pub fn trait_ref(self, interner: I) -> ty::TraitRef<I> {
         self.trait_ref_and_own_args(interner).0
-    }
-}
-
-/// The following methods work only with inherent associated type projections.
-impl<I: Interner> AliasTy<I> {
-    /// Transform the generic parameters to have the given `impl` args as the base and the GAT args on top of that.
-    ///
-    /// Does the following transformation:
-    ///
-    /// ```text
-    /// [Self, P_0...P_m] -> [I_0...I_n, P_0...P_m]
-    ///
-    ///     I_i impl args
-    ///     P_j GAT args
-    /// ```
-    pub fn rebase_inherent_args_onto_impl(
-        self,
-        impl_args: I::GenericArgs,
-        interner: I,
-    ) -> I::GenericArgs {
-        debug_assert_eq!(self.kind(interner), AliasTyKind::Inherent);
-        interner.mk_args_from_iter(impl_args.iter().chain(self.args.iter().skip(1)))
     }
 }
 
@@ -791,23 +764,6 @@ pub enum InferTy {
     FreshIntTy(u32),
     /// Like [`FreshTy`][Self::FreshTy], but as a replacement for [`FloatVar`][Self::FloatVar].
     FreshFloatTy(u32),
-}
-
-/// Raw `TyVid` are used as the unification key for `sub_relations`;
-/// they carry no values.
-impl UnifyKey for TyVid {
-    type Value = ();
-    #[inline]
-    fn index(&self) -> u32 {
-        self.as_u32()
-    }
-    #[inline]
-    fn from_index(i: u32) -> TyVid {
-        TyVid::from_u32(i)
-    }
-    fn tag() -> &'static str {
-        "TyVid"
-    }
 }
 
 impl UnifyValue for IntVarValue {
@@ -1184,4 +1140,14 @@ pub struct FnHeader<I: Interner> {
     pub c_variadic: bool,
     pub safety: I::Safety,
     pub abi: I::Abi,
+}
+
+#[derive_where(Clone, Copy, Debug, PartialEq, Eq, Hash; I: Interner)]
+#[cfg_attr(
+    feature = "nightly",
+    derive(Encodable_NoContext, Decodable_NoContext, HashStable_NoContext)
+)]
+#[derive(TypeVisitable_Generic, TypeFoldable_Generic, Lift_Generic)]
+pub struct CoroutineWitnessTypes<I: Interner> {
+    pub types: I::Tys,
 }

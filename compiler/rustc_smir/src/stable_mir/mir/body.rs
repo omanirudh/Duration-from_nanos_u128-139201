@@ -267,8 +267,10 @@ pub enum AssertMessage {
     RemainderByZero(Operand),
     ResumedAfterReturn(CoroutineKind),
     ResumedAfterPanic(CoroutineKind),
+    ResumedAfterDrop(CoroutineKind),
     MisalignedPointerDereference { required: Operand, found: Operand },
     NullPointerDereference,
+    InvalidEnumConstruction(Operand),
 }
 
 impl AssertMessage {
@@ -320,11 +322,30 @@ impl AssertMessage {
                 _,
             )) => Ok("`gen fn` should just keep returning `AssertMessage::None` after panicking"),
 
+            AssertMessage::ResumedAfterDrop(CoroutineKind::Coroutine(_)) => {
+                Ok("coroutine resumed after async drop")
+            }
+            AssertMessage::ResumedAfterDrop(CoroutineKind::Desugared(
+                CoroutineDesugaring::Async,
+                _,
+            )) => Ok("`async fn` resumed after async drop"),
+            AssertMessage::ResumedAfterDrop(CoroutineKind::Desugared(
+                CoroutineDesugaring::Gen,
+                _,
+            )) => Ok("`async gen fn` resumed after async drop"),
+            AssertMessage::ResumedAfterDrop(CoroutineKind::Desugared(
+                CoroutineDesugaring::AsyncGen,
+                _,
+            )) => Ok("`gen fn` should just keep returning `AssertMessage::None` after async drop"),
+
             AssertMessage::BoundsCheck { .. } => Ok("index out of bounds"),
             AssertMessage::MisalignedPointerDereference { .. } => {
                 Ok("misaligned pointer dereference")
             }
             AssertMessage::NullPointerDereference => Ok("null pointer dereference occurred"),
+            AssertMessage::InvalidEnumConstruction(_) => {
+                Ok("trying to construct an enum from an invalid value")
+            }
         }
     }
 }
@@ -1004,8 +1025,6 @@ pub enum CastKind {
     PointerExposeAddress,
     PointerWithExposedProvenance,
     PointerCoercion(PointerCoercion),
-    // FIXME(smir-rename): change this to PointerCoercion(DynStar)
-    DynStar,
     IntToInt,
     FloatToInt,
     FloatToFloat,

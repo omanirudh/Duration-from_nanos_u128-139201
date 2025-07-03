@@ -11,9 +11,10 @@ use rustc_hir::{self as hir, ParamName};
 use rustc_middle::bug;
 use rustc_middle::traits::ObligationCauseCode;
 use rustc_middle::ty::error::TypeError;
-use rustc_middle::ty::{self, IsSuggestable, Region, Ty, TyCtxt, TypeVisitableExt as _};
+use rustc_middle::ty::{
+    self, IsSuggestable, Region, Ty, TyCtxt, TypeVisitableExt as _, Upcast as _,
+};
 use rustc_span::{BytePos, ErrorGuaranteed, Span, Symbol, kw};
-use rustc_type_ir::Upcast as _;
 use tracing::{debug, instrument};
 
 use super::ObligationCauseAsDiagArg;
@@ -26,7 +27,10 @@ use crate::errors::{
 };
 use crate::fluent_generated as fluent;
 use crate::infer::region_constraints::GenericKind;
-use crate::infer::{self, InferCtxt, RegionResolutionError, RegionVariableOrigin, SubregionOrigin};
+use crate::infer::{
+    BoundRegionConversionTime, InferCtxt, RegionResolutionError, RegionVariableOrigin,
+    SubregionOrigin,
+};
 
 impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
     pub fn report_region_errors(
@@ -218,21 +222,21 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
 
     pub(super) fn note_region_origin(&self, err: &mut Diag<'_>, origin: &SubregionOrigin<'tcx>) {
         match *origin {
-            infer::Subtype(ref trace) => RegionOriginNote::WithRequirement {
+            SubregionOrigin::Subtype(ref trace) => RegionOriginNote::WithRequirement {
                 span: trace.cause.span,
                 requirement: ObligationCauseAsDiagArg(trace.cause.clone()),
                 expected_found: self.values_str(trace.values, &trace.cause, err.long_ty_path()),
             }
             .add_to_diag(err),
-            infer::Reborrow(span) => {
+            SubregionOrigin::Reborrow(span) => {
                 RegionOriginNote::Plain { span, msg: fluent::trait_selection_reborrow }
                     .add_to_diag(err)
             }
-            infer::RelateObjectBound(span) => {
+            SubregionOrigin::RelateObjectBound(span) => {
                 RegionOriginNote::Plain { span, msg: fluent::trait_selection_relate_object_bound }
                     .add_to_diag(err);
             }
-            infer::ReferenceOutlivesReferent(ty, span) => {
+            SubregionOrigin::ReferenceOutlivesReferent(ty, span) => {
                 RegionOriginNote::WithName {
                     span,
                     msg: fluent::trait_selection_reference_outlives_referent,
@@ -241,7 +245,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
                 .add_to_diag(err);
             }
-            infer::RelateParamBound(span, ty, opt_span) => {
+            SubregionOrigin::RelateParamBound(span, ty, opt_span) => {
                 RegionOriginNote::WithName {
                     span,
                     msg: fluent::trait_selection_relate_param_bound,
@@ -257,24 +261,24 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     .add_to_diag(err);
                 }
             }
-            infer::RelateRegionParamBound(span, _) => {
+            SubregionOrigin::RelateRegionParamBound(span, _) => {
                 RegionOriginNote::Plain {
                     span,
                     msg: fluent::trait_selection_relate_region_param_bound,
                 }
                 .add_to_diag(err);
             }
-            infer::CompareImplItemObligation { span, .. } => {
+            SubregionOrigin::CompareImplItemObligation { span, .. } => {
                 RegionOriginNote::Plain {
                     span,
                     msg: fluent::trait_selection_compare_impl_item_obligation,
                 }
                 .add_to_diag(err);
             }
-            infer::CheckAssociatedTypeBounds { ref parent, .. } => {
+            SubregionOrigin::CheckAssociatedTypeBounds { ref parent, .. } => {
                 self.note_region_origin(err, parent);
             }
-            infer::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
                 RegionOriginNote::Plain {
                     span,
                     msg: fluent::trait_selection_ascribe_user_type_prove_predicate,
@@ -292,7 +296,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         sup: Region<'tcx>,
     ) -> Diag<'a> {
         let mut err = match origin {
-            infer::Subtype(box trace) => {
+            SubregionOrigin::Subtype(box trace) => {
                 let terr = TypeError::RegionsDoesNotOutlive(sup, sub);
                 let mut err = self.report_and_explain_type_error(
                     trace,
@@ -346,7 +350,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
                 err
             }
-            infer::Reborrow(span) => {
+            SubregionOrigin::Reborrow(span) => {
                 let reference_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -368,7 +372,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: reference_valid.into_iter().chain(content_valid).collect(),
                 })
             }
-            infer::RelateObjectBound(span) => {
+            SubregionOrigin::RelateObjectBound(span) => {
                 let object_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -390,7 +394,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: object_valid.into_iter().chain(pointer_valid).collect(),
                 })
             }
-            infer::RelateParamBound(span, ty, opt_span) => {
+            SubregionOrigin::RelateParamBound(span, ty, opt_span) => {
                 let prefix = match sub.kind() {
                     ty::ReStatic => note_and_explain::PrefixKind::TypeSatisfy,
                     _ => note_and_explain::PrefixKind::TypeOutlive,
@@ -414,7 +418,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     note,
                 })
             }
-            infer::RelateRegionParamBound(span, ty) => {
+            SubregionOrigin::RelateRegionParamBound(span, ty) => {
                 let param_instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -456,7 +460,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: param_instantiated.into_iter().chain(param_must_outlive).collect(),
                 })
             }
-            infer::ReferenceOutlivesReferent(ty, span) => {
+            SubregionOrigin::ReferenceOutlivesReferent(ty, span) => {
                 let pointer_valid = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -479,7 +483,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     notes: pointer_valid.into_iter().chain(data_valid).collect(),
                 })
             }
-            infer::CompareImplItemObligation { span, impl_item_def_id, trait_item_def_id } => {
+            SubregionOrigin::CompareImplItemObligation {
+                span,
+                impl_item_def_id,
+                trait_item_def_id,
+            } => {
                 let mut err = self.report_extra_impl_obligation(
                     span,
                     impl_item_def_id,
@@ -498,7 +506,11 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 }
                 err
             }
-            infer::CheckAssociatedTypeBounds { impl_item_def_id, trait_item_def_id, parent } => {
+            SubregionOrigin::CheckAssociatedTypeBounds {
+                impl_item_def_id,
+                trait_item_def_id,
+                parent,
+            } => {
                 let mut err = self.report_concrete_failure(generic_param_scope, *parent, sub, sup);
 
                 // Don't mention the item name if it's an RPITIT, since that'll just confuse
@@ -519,7 +531,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 );
                 err
             }
-            infer::AscribeUserTypeProvePredicate(span) => {
+            SubregionOrigin::AscribeUserTypeProvePredicate(span) => {
                 let instantiated = note_and_explain::RegionExplanation::new(
                     self.tcx,
                     generic_param_scope,
@@ -617,7 +629,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         // I can't think how to do better than this right now. -nikomatsakis
         debug!(?placeholder_origin, ?sub, ?sup, "report_placeholder_failure");
         match placeholder_origin {
-            infer::Subtype(box ref trace)
+            SubregionOrigin::Subtype(box ref trace)
                 if matches!(
                     &trace.cause.code().peel_derives(),
                     ObligationCauseCode::WhereClause(..)
@@ -647,7 +659,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                     )
                 }
             }
-            infer::Subtype(box trace) => {
+            SubregionOrigin::Subtype(box trace) => {
                 let terr = TypeError::RegionsPlaceholderMismatch;
                 return self.report_and_explain_type_error(
                     trace,
@@ -707,7 +719,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
                 ty::Projection | ty::Inherent => {
                     format!("the associated type `{p}`")
                 }
-                ty::Weak => format!("the type alias `{p}`"),
+                ty::Free => format!("the type alias `{p}`"),
                 ty::Opaque => format!("the opaque type `{p}`"),
             },
         };
@@ -890,7 +902,7 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             (b'a'..=b'z')
                 .map(|c| format!("'{}", c as char))
                 .find(|candidate| !used_names.iter().any(|e| e.as_str() == candidate))
-                .unwrap_or("'lt".to_string())
+                .unwrap_or_else(|| "'lt".to_string())
         };
 
         let mut visitor = LifetimeReplaceVisitor {
@@ -944,8 +956,8 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
         debug!("report_sub_sup_conflict: sup_region={:?}", sup_region);
         debug!("report_sub_sup_conflict: sup_origin={:?}", sup_origin);
 
-        if let infer::Subtype(ref sup_trace) = sup_origin
-            && let infer::Subtype(ref sub_trace) = sub_origin
+        if let SubregionOrigin::Subtype(ref sup_trace) = sup_origin
+            && let SubregionOrigin::Subtype(ref sub_trace) = sub_origin
             && let Some((sup_expected, sup_found)) =
                 self.values_str(sup_trace.values, &sup_trace.cause, err.long_ty_path())
             && let Some((sub_expected, sub_found)) =
@@ -1003,30 +1015,38 @@ impl<'a, 'tcx> TypeErrCtxt<'a, 'tcx> {
             s
         };
         let var_description = match var_origin {
-            infer::MiscVariable(_) => String::new(),
-            infer::PatternRegion(_) => " for pattern".to_string(),
-            infer::BorrowRegion(_) => " for borrow expression".to_string(),
-            infer::Autoref(_) => " for autoref".to_string(),
-            infer::Coercion(_) => " for automatic coercion".to_string(),
-            infer::BoundRegion(_, br, infer::FnCall) => {
+            RegionVariableOrigin::Misc(_) => String::new(),
+            RegionVariableOrigin::PatternRegion(_) => " for pattern".to_string(),
+            RegionVariableOrigin::BorrowRegion(_) => " for borrow expression".to_string(),
+            RegionVariableOrigin::Autoref(_) => " for autoref".to_string(),
+            RegionVariableOrigin::Coercion(_) => " for automatic coercion".to_string(),
+            RegionVariableOrigin::BoundRegion(_, br, BoundRegionConversionTime::FnCall) => {
                 format!(" for lifetime parameter {}in function call", br_string(br))
             }
-            infer::BoundRegion(_, br, infer::HigherRankedType) => {
+            RegionVariableOrigin::BoundRegion(
+                _,
+                br,
+                BoundRegionConversionTime::HigherRankedType,
+            ) => {
                 format!(" for lifetime parameter {}in generic type", br_string(br))
             }
-            infer::BoundRegion(_, br, infer::AssocTypeProjection(def_id)) => format!(
+            RegionVariableOrigin::BoundRegion(
+                _,
+                br,
+                BoundRegionConversionTime::AssocTypeProjection(def_id),
+            ) => format!(
                 " for lifetime parameter {}in trait containing associated type `{}`",
                 br_string(br),
                 self.tcx.associated_item(def_id).name()
             ),
-            infer::RegionParameterDefinition(_, name) => {
+            RegionVariableOrigin::RegionParameterDefinition(_, name) => {
                 format!(" for lifetime parameter `{name}`")
             }
-            infer::UpvarRegion(ref upvar_id, _) => {
+            RegionVariableOrigin::UpvarRegion(ref upvar_id, _) => {
                 let var_name = self.tcx.hir_name(upvar_id.var_path.hir_id);
                 format!(" for capture of `{var_name}` by closure")
             }
-            infer::Nll(..) => bug!("NLL variable found in lexical phase"),
+            RegionVariableOrigin::Nll(..) => bug!("NLL variable found in lexical phase"),
         };
 
         struct_span_code_err!(
